@@ -7,102 +7,7 @@ import bpy
 import numpy as np
 from PIL import Image
 
-
-def extract_material_base_image(mat):
-    if not mat or not mat.use_nodes or not mat.node_tree:
-        return None
-    nodes = mat.node_tree.nodes
-
-    base_node = nodes.get("mmd_base_tex")
-    if base_node and base_node.type == "TEX_IMAGE" and base_node.image:
-        return base_node.image
-
-    mmd_shader = nodes.get("mmd_shader")
-    if mmd_shader and "Base Tex" in mmd_shader.inputs:
-        inp = mmd_shader.inputs["Base Tex"]
-        if inp.is_linked:
-            src = inp.links[0].from_node
-            if src.type == "TEX_IMAGE" and src.image:
-                return src.image
-
-    for node in nodes:
-        if node.type == "BSDF_PRINCIPLED":
-            inp = node.inputs.get("Base Color")
-            if inp and inp.is_linked:
-                src = inp.links[0].from_node
-                if src.type == "TEX_IMAGE" and src.image:
-                    return src.image
-
-    for node in nodes:
-        if node.type == "TEX_IMAGE" and node.image:
-            if node.name in ("mmd_toon_tex", "mmd_sphere_tex"):
-                continue
-            img_low = node.image.name.lower()
-            if any(
-                kw in img_low
-                for kw in (
-                    "spa",
-                    "sph",
-                    "toon",
-                    "hair hi light",
-                    "alphamc",
-                    "bodymc",
-                    "mc12",
-                )
-            ):
-                continue
-            return node.image
-    return None
-
-
-def classify_role(mat_name: str, img_name: str) -> str:
-    m_low = mat_name.lower()
-    s = f"{mat_name} {img_name}".lower()
-
-    if any(
-        kw in s
-        for kw in (
-            "eyehi",
-            "eye hi",
-            "eyelight",
-            "emo",
-            "cheek",
-            "heng",
-            "boli",
-            "glass",
-            "yeti",
-            "liquid",
-            "fx",
-            "玻璃",
-            "液体",
-            "特效",
-            "腮红",
-        )
-    ) or re.search(r"(^|[_\-\s])hi\d*($|[_\-\s])", m_low):
-        return "fx_overlay"
-
-    if any(kw in m_low for kw in ("lash", "mayu", "brow", "eyeline", "睫", "眉")):
-        return "lash_brow"
-
-    if (
-        "eye" in m_low
-        or "bai" in m_low
-        or "瞳" in m_low
-        or "目" in m_low
-        or "眼" in m_low
-    ):
-        return "eye"
-
-    if any(kw in s for kw in ("face", "kao", "顔", "脸")):
-        return "face"
-
-    if any(kw in s for kw in ("skin", "hada", "sink", "肌", "素体", "皮肤")):
-        return "skin"
-
-    if any(kw in s for kw in ("hair", "bangs", "kami", "髪", "刘海")):
-        return "hair"
-
-    return "cloth"
+from step0_mat_map import classify_material_role, extract_material_base_image
 
 
 def resolve_disk_path(img, texture_dir):
@@ -131,7 +36,7 @@ def image_to_pil_rgba(img_obj, disk_path):
     if img_obj and img_obj.has_data and img_obj.size[0] > 0 and img_obj.size[1] > 0:
         w, h = img_obj.size[0], img_obj.size[1]
         px = np.array(img_obj.pixels[:], dtype=np.float32).reshape((h, w, 4))
-        px = np.flipud(px)  # Blender 像素自底向上，PIL 自顶向下
+        px = np.flipud(px)
         return Image.fromarray(
             np.clip(px * 255.0, 0, 255).astype(np.uint8), mode="RGBA"
         )
@@ -143,7 +48,7 @@ def find_emissive_counterpart(disk_path, texture_dir):
         return None
     stem = os.path.splitext(os.path.basename(disk_path))[0]
     candidates_prefix = []
-    for suffix in ("_D_noalpha2", "_D_noalpha", "_D1", "_D2", "_D"):
+    for suffix in ("_D_noalpha2", "_D_noalpha", "_D1", "_D2", "_D", "_DH"):
         if stem.endswith(suffix):
             base_prefix = stem[: -len(suffix)]
             candidates_prefix.extend(
@@ -185,6 +90,11 @@ def detect_alpha_mode(rgba_arr, role, mat_or_img_name):
     name_low = mat_or_img_name.lower()
     if role == "fx_overlay":
         return True, "BLEND"
+
+    # 脸/皮肤/眼睛/口腔/常规服装(含UE packed mask 的 Up_D/Down_D) 强制 OPAQUE，避免被 UE 遮罩抠穿皮肤
+    if role not in ("lash_brow", "cutout_cloth"):
+        return False, "OPAQUE"
+
     if "noalpha" in name_low and "alpha" not in name_low.replace("noalpha", ""):
         return False, "OPAQUE"
 
@@ -229,7 +139,7 @@ def run(texture_dir, max_tex_size=1024):
         base_img = extract_material_base_image(mat)
         if not base_img:
             continue
-        role = classify_role(mat.name, base_img.name)
+        role = classify_material_role(mat.name, base_img.name)
         if base_img.name not in image_jobs:
             image_jobs[base_img.name] = (base_img, role, f"{mat.name} {base_img.name}")
 
@@ -240,9 +150,6 @@ def run(texture_dir, max_tex_size=1024):
         try:
             pil_img = image_to_pil_rgba(img_obj, disk_path)
             if pil_img is None:
-                print(
-                    f"   ⚠️ 无法读取贴图 [{img_name}]（既无磁盘文件也无像素数据），跳过。"
-                )
                 continue
 
             pil_img = resize_if_needed(pil_img, max_tex_size)
@@ -295,7 +202,7 @@ def run(texture_dir, max_tex_size=1024):
             }
             size_kb = os.path.getsize(lit_path) // 1024
             print(
-                f"   ✅ [贴图压缩] {raw_base} -> {lit_fname} ({size_kb} KB, {pil_img.size[0]}x{pil_img.size[1]}, alpha={alpha_mode})"
+                f"   ✅ [贴图压缩] {raw_base} -> {lit_fname} ({size_kb} KB, role={role}, alpha={alpha_mode})"
             )
         except Exception as e:
             print(f"   ⚠️ 贴图 [{img_name}] 处理失败: {e}")

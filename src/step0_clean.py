@@ -1,10 +1,11 @@
 import math
-import re
 from collections import defaultdict
 
 import bmesh
 import bpy
 from mathutils import Vector, kdtree
+
+from step0_mat_map import classify_surface_for_normals, extract_material_base_image
 
 
 def snapshot_custom_normals(mesh):
@@ -45,82 +46,6 @@ def restore_custom_normals(mesh, kd, orig_loop_normals):
 
     mesh.normals_split_custom_set(restored)
     mesh.update()
-
-
-def classify_poly_surface(obj_name_low, mat_name_low):
-    target = mat_name_low or obj_name_low
-
-    EXCLUDE_KW = (
-        "eye",
-        "lash",
-        "mayu",
-        "brow",
-        "eyeline",
-        "emo",
-        "cheek",
-        "heng",
-        "bai",
-        "tooth",
-        "teeth",
-        "tongue",
-        "mouth_in",
-        "hair",
-        "bangs",
-        "kami",
-        "ribbon",
-        "metal",
-        "jinshu",
-        "boli",
-        "yeti",
-        "glass",
-        "button",
-        "shoe",
-        "boot",
-        "skirt",
-        "jacket",
-        "alpha",
-        "cloth",
-        "fx",
-        "weapon",
-        "pingzi",
-        "瞳",
-        "目",
-        "睫",
-        "眉",
-        "歯",
-        "舌",
-        "牙",
-        "髪",
-        "发",
-        "刘海",
-        "靴",
-        "鞋",
-        "金属",
-        "玻璃",
-        "特效",
-        "武器",
-        "头花",
-        "辫子",
-        "袖子",
-        "新規",
-    )
-    if any(kw in target for kw in EXCLUDE_KW) or re.search(
-        r"(^|[_\-\s])hi\d*($|[_\-\s])", target
-    ):
-        return "other"
-
-    if any(kw in target for kw in ("face", "kao", "顔", "脸")):
-        return "face_skin"
-
-    if any(kw in target for kw in ("skin", "hada", "naked", "肌", "素体", "皮肤")):
-        return "body_skin"
-
-    if any(
-        kw in target for kw in ("bdy", "body", "karada", "体", "上衣", "下装")
-    ) or re.search(r"(^|[_\-\s])(up|down)(\d*|[_\-\s])", target):
-        return "body_mixed"
-
-    return "other"
 
 
 def get_head_bone_local_z(obj):
@@ -302,17 +227,26 @@ def repair_skin_normals(obj):
         mesh.calc_normals_split()
         loop_normals = [tuple(l.normal) for l in mesh.loops]
 
-    obj_name_low = obj.name.lower()
-    groups = {"face_skin": [], "body_skin": [], "body_mixed": []}
+    # 预先缓存每个材质槽对应的表面类型（结合材质名 + 贴图名）
+    slot_kinds = []
+    for mat in mesh.materials:
+        if not mat:
+            slot_kinds.append("other")
+            continue
+        b_img = extract_material_base_image(mat)
+        slot_kinds.append(
+            classify_surface_for_normals(
+                obj.name, mat.name, b_img.name if b_img else ""
+            )
+        )
 
+    groups = {"face_skin": [], "body_skin": [], "body_mixed": []}
     for p_idx, poly in enumerate(mesh.polygons):
-        mat_name_low = ""
-        if (
-            0 <= poly.material_index < len(mesh.materials)
-            and mesh.materials[poly.material_index]
-        ):
-            mat_name_low = mesh.materials[poly.material_index].name.lower()
-        kind = classify_poly_surface(obj_name_low, mat_name_low)
+        kind = (
+            slot_kinds[poly.material_index]
+            if 0 <= poly.material_index < len(slot_kinds)
+            else "other"
+        )
         if kind in groups:
             groups[kind].append(p_idx)
 
@@ -457,7 +391,6 @@ def run():
             obj.data.shape_keys and len(obj.data.shape_keys.key_blocks) > 1
         )
 
-        # 关键修复：含形态键的网格严禁 remove_doubles 或 dissolve_degenerate，防止删掉嘴角/眼睑折叠微面导致表情黑角穿帮
         if not has_shape_keys:
             kd, orig_loop_normals = None, None
             try:

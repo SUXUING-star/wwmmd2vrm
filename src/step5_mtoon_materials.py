@@ -1,10 +1,9 @@
 import json
 import os
-import re
 
 import bpy
 
-from step4_bake_texture import classify_role, extract_material_base_image
+from step0_mat_map import classify_material_role, extract_material_base_image
 
 
 def load_baked_img(texture_dir, filename, colorspace="sRGB"):
@@ -75,37 +74,6 @@ def run(texture_dir):
             with open(m_path, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
 
-    ALLOW_CUTOUT_KEYWORDS = [
-        "lash",
-        "mayu",
-        "eyelash",
-        "eyeline",
-        "alpha",
-        "lace",
-        "眉",
-        "睫",
-        "蕾丝",
-    ]
-    ALLOW_BLEND_KEYWORDS = [
-        "eyehi",
-        "eye hi",
-        "eyelight",
-        "emo",
-        "cheek",
-        "heng",
-        "boli",
-        "yeti",
-        "glass",
-        "fx",
-        "shadow",
-        "trans",
-        "玻璃",
-        "液体",
-        "特效",
-        "半透",
-        "腮红",
-    ]
-
     converted = 0
     total = 0
 
@@ -119,7 +87,7 @@ def run(texture_dir):
         orig_img = extract_material_base_image(mat)
         diffuse_rgb, mat_alpha, is_double_sided = extract_mmd_or_bsdf_props(mat)
         orig_img_name = orig_img.name if orig_img else ""
-        role = classify_role(mat.name, orig_img_name)
+        role = classify_material_role(mat.name, orig_img_name)
 
         info = manifest.get(orig_img_name, {})
         lit_img = load_baked_img(texture_dir, info.get("lit"), "sRGB") or orig_img
@@ -153,22 +121,11 @@ def run(texture_dir):
         else:
             gltf.emissive_factor = (0.0, 0.0, 0.0)
 
-        mat_low = mat.name.lower()
         suggested_alpha = info.get("alpha_mode", "OPAQUE")
-        is_hi_overlay = bool(re.search(r"(^|[_\-\s])hi\d*($|[_\-\s])", mat_low))
-
-        if (
-            mat_alpha < 0.99
-            or role == "fx_overlay"
-            or is_hi_overlay
-            or any(kw in mat_low for kw in ALLOW_BLEND_KEYWORDS)
-            or suggested_alpha == "BLEND"
-        ):
+        if mat_alpha < 0.99 or role == "fx_overlay" or suggested_alpha == "BLEND":
             gltf.alpha_mode = "BLEND"
-        elif (
-            role == "lash_brow"
-            or any(kw in mat_low for kw in ALLOW_CUTOUT_KEYWORDS)
-            or suggested_alpha == "MASK"
+        elif role in ("lash_brow", "cutout_cloth") and (
+            suggested_alpha == "MASK" or info.get("has_alpha")
         ):
             gltf.alpha_mode = "MASK"
             gltf.alpha_cutoff = 0.5
@@ -206,7 +163,6 @@ def run(texture_dir):
             mat.node_tree.update_tag()
         converted += 1
 
-    # 强制移除所有零引用图像与孤立数据块
     try:
         bpy.ops.outliner.orphans_purge(
             do_local_ids=True, do_linked_ids=True, do_recursive=True

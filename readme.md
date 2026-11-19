@@ -30,7 +30,6 @@ Each character directory in `public/` requires a `config.json` next to the `.ble
     "vrm_name": "Lili",
     "version": "1.0.0",
     "author": "kuro games",
-    "vrma_path": ["./motion.vrma"],
     "copyright": "",
     "contact": "",
     "reference": "",
