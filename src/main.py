@@ -23,7 +23,6 @@ def resolve_config_paths(config):
     if not os.path.isabs(tex_dir):
         config["texture_dir"] = os.path.abspath(os.path.join(blend_dir, tex_dir))
 
-    # 直接在当前 .blend 所在目录导出（若 config.json 写了相对子目录也基于当前目录）
     models_dir = config.get("models_dir") or "."
     if not os.path.isabs(models_dir):
         config["models_dir"] = os.path.abspath(os.path.join(blend_dir, models_dir))
@@ -59,13 +58,16 @@ def run(config):
     en = config["en_name"]
     tex = config["texture_dir"]
     max_tex_size = int(config.get("max_tex_size", 1024))
+    max_bones = int(config.get("max_bones", 240))
 
     print(f"\n>>> [wwmmd2vrm] 开始处理鸣潮模型: {jp} -> {en}")
     print(f"   [路径] VRM 导出目录: {config['models_dir']}")
-    print(f"   [路径] 贴图绝对路径: {tex} (max_tex_size={max_tex_size})")
+    print(
+        f"   [路径] 贴图绝对路径: {tex} (max_tex_size={max_tex_size}, max_bones={max_bones})"
+    )
 
     step0_clean.run()
-    step1_skeleton.run(jp, en)
+    step1_skeleton.run(jp, en, max_bones=max_bones)
     step2_expressions.run()
     step3_bind_vrm.run()
     step4_bake_texture.run(tex, max_tex_size=max_tex_size)

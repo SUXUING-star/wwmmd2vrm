@@ -51,7 +51,6 @@ def find_first_bone(bones_dict, candidates):
 
 
 def resolve_torso_chain(edit_bones, hips_b, neck_or_head_b, arm_l_b, arm_r_b):
-    """从 Neck/Head 向上追溯到 Hips 的真实直线链，保证 Spine -> Chest -> UpperChest 严格合规"""
     if not hips_b or not neck_or_head_b:
         return {}
 
@@ -62,9 +61,8 @@ def resolve_torso_chain(edit_bones, hips_b, neck_or_head_b, arm_l_b, arm_r_b):
         cur = cur.parent
     if cur != hips_b:
         return {}
-    chain.reverse()  # 从下到上：[Spine候选, ..., Neck下方]
+    chain.reverse()
 
-    # 筛选同时是左右大臂与脖子祖先的躯干骨
     valid_torso = [
         b
         for b in chain
@@ -114,7 +112,6 @@ def validate_and_assign_vrm_humanoid(armature_obj):
     bones = armature_obj.data.bones
     map_vrm0, map_vrm1 = build_vrm_humanoid_mappings()
 
-    # 严格按父子关系过滤，防止任何非法层级导致 VRM 导出崩溃
     resolved = {}
     for key, cands in map_vrm1.items():
         for c in cands:
@@ -131,7 +128,6 @@ def validate_and_assign_vrm_humanoid(armature_obj):
     arm_l = bones.get(resolved.get("leftUpperArm", ""))
     arm_r = bones.get(resolved.get("rightUpperArm", ""))
 
-    # 校验 UpperChest：必须是 Chest 后代，且是 Neck/Head/双臂的祖先
     if upper_chest:
         ok = (
             chest is not None
@@ -199,8 +195,103 @@ def validate_and_assign_vrm_humanoid(armature_obj):
     return resolved
 
 
-def run(jp_model_name, en_model_name):
-    print(">>> [步骤 1] 规整鸣潮 MMD 骨骼命名、校验躯干链路与层级拍平...")
+def bone_depth(b):
+    d = 0
+    cur = b.parent
+    while cur:
+        d += 1
+        cur = cur.parent
+    return d
+
+
+def merge_excess_bones_to_limit(armature_obj, protected_names, max_bones=240):
+    """无损将超出上限的末端辅助骨/末梢物理骨权重累加合并到父骨骼，将总骨骼数压至 <=240（适配 VRoid Hub）"""
+    if max_bones <= 0 or len(armature_obj.data.bones) <= max_bones:
+        return 0
+
+    bound_meshes = [
+        o
+        for o in bpy.data.objects
+        if o.type == "MESH"
+        and o.data
+        and (
+            o.parent == armature_obj
+            or any(
+                m.type == "ARMATURE" and m.object == armature_obj for m in o.modifiers
+            )
+        )
+    ]
+
+    merged_total = 0
+    while len(armature_obj.data.bones) > max_bones:
+        excess = len(armature_obj.data.bones) - max_bones
+        # 仅挑选非受保护、有父骨骼的末端叶子骨，保证绝不破坏任何主骨骼结构
+        leaves = [
+            b
+            for b in armature_obj.data.bones
+            if len(b.children) == 0
+            and b.parent is not None
+            and b.name not in protected_names
+        ]
+        if not leaves:
+            break
+
+        # 优先合并扭转/辅助骨，其次按链条最深末端优先（保留靠近头/腰的根部物理段）
+        def leaf_priority(b):
+            low = b.name.lower()
+            is_helper = (
+                0
+                if any(
+                    k in low
+                    for k in ("twist", "bip001_", "aux", "piao", "cancel", "_ex")
+                )
+                else 1
+            )
+            return (is_helper, -bone_depth(b))
+
+        leaves.sort(key=leaf_priority)
+        batch = leaves[:excess]
+        child_to_parent = {b.name: b.parent.name for b in batch}
+
+        # 1. 把本批次末端骨的顶点权重全部无损转移累加到各自父骨骼
+        for mesh_obj in bound_meshes:
+            vgs = mesh_obj.vertex_groups
+            if not vgs:
+                continue
+            src_idx_to_dst = {}
+            for src_name, dst_name in child_to_parent.items():
+                if src_name in vgs:
+                    dst_vg = vgs.get(dst_name) or vgs.new(name=dst_name)
+                    src_idx_to_dst[vgs[src_name].index] = dst_vg
+
+            if not src_idx_to_dst:
+                continue
+
+            for v in mesh_obj.data.vertices:
+                for g in v.groups:
+                    dst_vg = src_idx_to_dst.get(g.group)
+                    if dst_vg is not None and g.weight > 0.0:
+                        dst_vg.add([v.index], g.weight, "ADD")
+
+            for src_name in child_to_parent:
+                if src_name in vgs:
+                    vgs.remove(vgs[src_name])
+
+        # 2. 在 Edit 模式中删除已转移完权重的末端骨
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.mode_set(mode="EDIT")
+        eb = armature_obj.data.edit_bones
+        for bname in child_to_parent:
+            if bname in eb:
+                eb.remove(eb[bname])
+                merged_total += 1
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    return merged_total
+
+
+def run(jp_model_name, en_model_name, max_bones=240):
+    print(">>> [步骤 1] 规整鸣潮 MMD 骨骼命名、校验躯干链路与骨骼数量瘦身...")
     armature_obj = next((o for o in bpy.data.objects if o.type == "ARMATURE"), None)
     if armature_obj:
         weighted_bones = collect_weighted_bone_names(armature_obj)
@@ -399,6 +490,13 @@ def run(jp_model_name, en_model_name):
                 renamed += 1
 
         assigned = validate_and_assign_vrm_humanoid(armature_obj)
+        protected_human = set(assigned.values()) | {"Root"}
+        merged_cnt = merge_excess_bones_to_limit(
+            armature_obj, protected_human, max_bones=max_bones
+        )
+        if merged_cnt > 0:
+            assigned = validate_and_assign_vrm_humanoid(armature_obj)
+
         final_w = collect_weighted_bone_names(armature_obj)
         core_check = {
             k: f"{assigned.get(k)}({final_w.get(assigned.get(k), 0)}v)"
@@ -412,11 +510,14 @@ def run(jp_model_name, en_model_name):
                 "rightUpperArm",
                 "leftUpperLeg",
                 "rightUpperLeg",
+                "leftFoot",
+                "rightFoot",
             )
             if k in assigned
         }
         print(
-            f"   🦴 骨骼处理完成：保留 {len(armature_obj.data.bones)} 根，清理 {len(to_remove)}+{pruned_cnt} 根废骨，重命名 {renamed} 根。"
+            f"   🦴 骨骼处理完成：最终保留 {len(armature_obj.data.bones)} 根（<= {max_bones}），"
+            f"清理 {len(to_remove)}+{pruned_cnt} 根废骨，无损权重合并 {merged_cnt} 根多余末端骨，重命名 {renamed} 根。"
         )
         print(f"   ⚖️ [核心骨骼链路与权重] {core_check}")
 

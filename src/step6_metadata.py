@@ -17,8 +17,66 @@ TYPE_COUNT = {
 }
 
 
+def ensure_vrm_neutral_preset(vrm_path):
+    """在不改动任何二进制顶点/贴图/形态键缓冲区的前提下，确保 JSON 中显式包含 neutral 预设"""
+    with open(vrm_path, "rb") as f:
+        data = f.read()
+
+    magic, version, total_len = struct.unpack_from("<III", data, 0)
+    if magic != 0x46546C67:
+        return
+
+    offset = 12
+    json_bytes = None
+    bin_bytes = b""
+    while offset < len(data):
+        chunk_len, chunk_type = struct.unpack_from("<II", data, offset)
+        offset += 8
+        chunk_data = data[offset : offset + chunk_len]
+        if chunk_type == 0x4E4F534A:
+            json_bytes = chunk_data
+        elif chunk_type == 0x004E4942:
+            bin_bytes = chunk_data
+        offset += chunk_len
+
+    if not json_bytes:
+        return
+
+    gltf = json.loads(json_bytes.decode("utf-8"))
+    vrm_ext = gltf.get("extensions", {}).get("VRMC_vrm")
+    if not isinstance(vrm_ext, dict):
+        return
+
+    exprs = vrm_ext.setdefault("expressions", {})
+    preset = exprs.setdefault("preset", {})
+    if "neutral" in preset:
+        return
+
+    preset["neutral"] = {
+        "isBinary": False,
+        "overrideBlink": "none",
+        "overrideLookAt": "none",
+        "overrideMouth": "none",
+    }
+
+    new_json = json.dumps(gltf, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    while len(new_json) % 4 != 0:
+        new_json += b" "
+
+    new_total = 12 + 8 + len(new_json) + (8 + len(bin_bytes) if bin_bytes else 0)
+    with open(vrm_path, "wb") as f:
+        f.write(struct.pack("<III", 0x46546C67, version, new_total))
+        f.write(struct.pack("<II", len(new_json), 0x4E4F534A))
+        f.write(new_json)
+        if bin_bytes:
+            f.write(struct.pack("<II", len(bin_bytes), 0x004E4942))
+            f.write(bin_bytes)
+
+
 def compact_vrm_morphs_sparse(vrm_path):
-    """将 VRM(GLB) 中稠密 Morph Target 转为标准 glTF 2.0 Sparse，按存活数据精确重建 BIN，并补全 neutral 预设"""
+    """可选（仅限 three-vrm 等支持稀疏访问器的前端）：将稠密 Morph 转为 glTF 2.0 Sparse"""
     with open(vrm_path, "rb") as f:
         data = f.read()
 
@@ -43,22 +101,6 @@ def compact_vrm_morphs_sparse(vrm_path):
         return
 
     gltf = json.loads(json_bytes.decode("utf-8"))
-
-    # 确保 VRM 1.0 preset 里显式包含 neutral
-    vrm_ext = gltf.get("extensions", {}).get("VRMC_vrm")
-    if isinstance(vrm_ext, dict):
-        exprs = vrm_ext.setdefault("expressions", {})
-        preset = exprs.setdefault("preset", {})
-        preset.setdefault(
-            "neutral",
-            {
-                "isBinary": False,
-                "overrideBlink": "none",
-                "overrideLookAt": "none",
-                "overrideMouth": "none",
-            },
-        )
-
     bvs = gltf.get("bufferViews", [])
     accessors = gltf.get("accessors", [])
 
@@ -68,6 +110,9 @@ def compact_vrm_morphs_sparse(vrm_path):
             for tgt in prim.get("targets", []):
                 for acc_idx in tgt.values():
                     morph_acc_indices.add(acc_idx)
+
+    if not morph_acc_indices:
+        return
 
     new_sparse_chunks = []
     for acc_idx in sorted(morph_acc_indices):
@@ -119,130 +164,130 @@ def compact_vrm_morphs_sparse(vrm_path):
             (acc, len(nz_indices), idx_comp_type, idx_bytes, val_bytes)
         )
 
-    if new_sparse_chunks:
-        out_bin = bytearray()
-        new_bvs = []
+    if not new_sparse_chunks:
+        return
 
-        def append_aligned(chunk_bytes):
-            while len(out_bin) % 4 != 0:
-                out_bin.append(0)
-            off = len(out_bin)
-            out_bin.extend(chunk_bytes)
-            return off, len(chunk_bytes)
+    out_bin = bytearray()
+    new_bvs = []
 
-        for im in gltf.get("images", []):
-            if "bufferView" not in im:
-                continue
-            old_bv = bvs[im["bufferView"]]
-            old_off = old_bv.get("byteOffset", 0)
-            old_len = old_bv["byteLength"]
-            new_off, new_len = append_aligned(bin_bytes[old_off : old_off + old_len])
-            im["bufferView"] = len(new_bvs)
-            new_bvs.append({"buffer": 0, "byteOffset": new_off, "byteLength": new_len})
+    def append_aligned(chunk_bytes):
+        while len(out_bin) % 4 != 0:
+            out_bin.append(0)
+        off = len(out_bin)
+        out_bin.extend(chunk_bytes)
+        return off, len(chunk_bytes)
 
-        for acc in accessors:
-            if "sparse" not in acc:
-                continue
-            sp = acc["sparse"]
-            for key in ("indices", "values"):
-                if key in sp and "bufferView" in sp[key]:
-                    old_bv = bvs[sp[key]["bufferView"]]
-                    old_off = old_bv.get("byteOffset", 0)
-                    old_len = old_bv["byteLength"]
-                    new_off, new_len = append_aligned(
-                        bin_bytes[old_off : old_off + old_len]
-                    )
-                    sp[key]["bufferView"] = len(new_bvs)
-                    new_bvs.append(
-                        {"buffer": 0, "byteOffset": new_off, "byteLength": new_len}
-                    )
+    for im in gltf.get("images", []):
+        if "bufferView" not in im:
+            continue
+        old_bv = bvs[im["bufferView"]]
+        old_off = old_bv.get("byteOffset", 0)
+        old_len = old_bv["byteLength"]
+        new_off, new_len = append_aligned(bin_bytes[old_off : old_off + old_len])
+        im["bufferView"] = len(new_bvs)
+        new_bvs.append({"buffer": 0, "byteOffset": new_off, "byteLength": new_len})
 
-        bv_to_accs = {}
-        for acc in accessors:
-            if "bufferView" in acc:
-                bv_to_accs.setdefault(acc["bufferView"], []).append(acc)
-
-        for old_bv_idx, acc_list in bv_to_accs.items():
-            old_bv = bvs[old_bv_idx]
-            old_bv_off = old_bv.get("byteOffset", 0)
-            stride = old_bv.get("byteStride")
-            target = old_bv.get("target")
-
-            is_interleaved = False
-            if stride:
-                for acc in acc_list:
-                    elem_sz = COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
-                    if stride > elem_sz:
-                        is_interleaved = True
-                        break
-
-            if is_interleaved:
-                min_off = min(acc.get("byteOffset", 0) for acc in acc_list)
-                max_end = max(
-                    acc.get("byteOffset", 0)
-                    + (acc["count"] - 1) * stride
-                    + COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
-                    for acc in acc_list
-                )
+    for acc in accessors:
+        if "sparse" not in acc:
+            continue
+        sp = acc["sparse"]
+        for key in ("indices", "values"):
+            if key in sp and "bufferView" in sp[key]:
+                old_bv = bvs[sp[key]["bufferView"]]
+                old_off = old_bv.get("byteOffset", 0)
+                old_len = old_bv["byteLength"]
                 new_off, new_len = append_aligned(
-                    bin_bytes[old_bv_off + min_off : old_bv_off + max_end]
+                    bin_bytes[old_off : old_off + old_len]
+                )
+                sp[key]["bufferView"] = len(new_bvs)
+                new_bvs.append(
+                    {"buffer": 0, "byteOffset": new_off, "byteLength": new_len}
+                )
+
+    bv_to_accs = {}
+    for acc in accessors:
+        if "bufferView" in acc:
+            bv_to_accs.setdefault(acc["bufferView"], []).append(acc)
+
+    for old_bv_idx, acc_list in bv_to_accs.items():
+        old_bv = bvs[old_bv_idx]
+        old_bv_off = old_bv.get("byteOffset", 0)
+        stride = old_bv.get("byteStride")
+        target = old_bv.get("target")
+
+        is_interleaved = False
+        if stride:
+            for acc in acc_list:
+                elem_sz = COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
+                if stride > elem_sz:
+                    is_interleaved = True
+                    break
+
+        if is_interleaved:
+            min_off = min(acc.get("byteOffset", 0) for acc in acc_list)
+            max_end = max(
+                acc.get("byteOffset", 0)
+                + (acc["count"] - 1) * stride
+                + COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
+                for acc in acc_list
+            )
+            new_off, new_len = append_aligned(
+                bin_bytes[old_bv_off + min_off : old_bv_off + max_end]
+            )
+            new_bv_idx = len(new_bvs)
+            bv_obj = {
+                "buffer": 0,
+                "byteOffset": new_off,
+                "byteLength": new_len,
+                "byteStride": stride,
+            }
+            if target is not None:
+                bv_obj["target"] = target
+            new_bvs.append(bv_obj)
+            for acc in acc_list:
+                acc["bufferView"] = new_bv_idx
+                new_acc_off = acc.get("byteOffset", 0) - min_off
+                if new_acc_off > 0:
+                    acc["byteOffset"] = new_acc_off
+                else:
+                    acc.pop("byteOffset", None)
+        else:
+            for acc in acc_list:
+                elem_sz = COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
+                acc_len = acc["count"] * elem_sz
+                acc_start = old_bv_off + acc.get("byteOffset", 0)
+                new_off, new_len = append_aligned(
+                    bin_bytes[acc_start : acc_start + acc_len]
                 )
                 new_bv_idx = len(new_bvs)
-                bv_obj = {
-                    "buffer": 0,
-                    "byteOffset": new_off,
-                    "byteLength": new_len,
-                    "byteStride": stride,
-                }
+                bv_obj = {"buffer": 0, "byteOffset": new_off, "byteLength": new_len}
                 if target is not None:
                     bv_obj["target"] = target
                 new_bvs.append(bv_obj)
-                for acc in acc_list:
-                    acc["bufferView"] = new_bv_idx
-                    new_acc_off = acc.get("byteOffset", 0) - min_off
-                    if new_acc_off > 0:
-                        acc["byteOffset"] = new_acc_off
-                    else:
-                        acc.pop("byteOffset", None)
-            else:
-                for acc in acc_list:
-                    elem_sz = COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
-                    acc_len = acc["count"] * elem_sz
-                    acc_start = old_bv_off + acc.get("byteOffset", 0)
-                    new_off, new_len = append_aligned(
-                        bin_bytes[acc_start : acc_start + acc_len]
-                    )
-                    new_bv_idx = len(new_bvs)
-                    bv_obj = {"buffer": 0, "byteOffset": new_off, "byteLength": new_len}
-                    if target is not None:
-                        bv_obj["target"] = target
-                    new_bvs.append(bv_obj)
-                    acc["bufferView"] = new_bv_idx
-                    acc.pop("byteOffset", None)
+                acc["bufferView"] = new_bv_idx
+                acc.pop("byteOffset", None)
 
-        for acc, sp_count, idx_comp_type, idx_bytes, val_bytes in new_sparse_chunks:
-            idx_off, idx_len = append_aligned(idx_bytes)
-            idx_bv = len(new_bvs)
-            new_bvs.append({"buffer": 0, "byteOffset": idx_off, "byteLength": idx_len})
+    for acc, sp_count, idx_comp_type, idx_bytes, val_bytes in new_sparse_chunks:
+        idx_off, idx_len = append_aligned(idx_bytes)
+        idx_bv = len(new_bvs)
+        new_bvs.append({"buffer": 0, "byteOffset": idx_off, "byteLength": idx_len})
 
-            val_off, val_len = append_aligned(val_bytes)
-            val_bv = len(new_bvs)
-            new_bvs.append({"buffer": 0, "byteOffset": val_off, "byteLength": val_len})
+        val_off, val_len = append_aligned(val_bytes)
+        val_bv = len(new_bvs)
+        new_bvs.append({"buffer": 0, "byteOffset": val_off, "byteLength": val_len})
 
-            acc["sparse"] = {
-                "count": sp_count,
-                "indices": {"bufferView": idx_bv, "componentType": idx_comp_type},
-                "values": {"bufferView": val_bv},
-            }
+        acc["sparse"] = {
+            "count": sp_count,
+            "indices": {"bufferView": idx_bv, "componentType": idx_comp_type},
+            "values": {"bufferView": val_bv},
+        }
 
-        while len(out_bin) % 4 != 0:
-            out_bin.append(0)
+    while len(out_bin) % 4 != 0:
+        out_bin.append(0)
 
-        gltf["bufferViews"] = new_bvs
-        if gltf.get("buffers"):
-            gltf["buffers"][0]["byteLength"] = len(out_bin)
-    else:
-        out_bin = bin_bytes
+    gltf["bufferViews"] = new_bvs
+    if gltf.get("buffers"):
+        gltf["buffers"][0]["byteLength"] = len(out_bin)
 
     new_json = json.dumps(gltf, separators=(",", ":"), ensure_ascii=False).encode(
         "utf-8"
@@ -290,12 +335,15 @@ def inspect_exported_vrm(vrm_path):
         )
         img_bytes += sz
         img_details.append((sz, im.get("name", "img"), im.get("mimeType", "")))
-    img_details.sort(reverse=True)
 
     morph_bv_indices = set()
     morph_count = 0
+    joint_types = set()
     for mesh in gltf.get("meshes", []):
         for prim in mesh.get("primitives", []):
+            j_acc = prim.get("attributes", {}).get("JOINTS_0")
+            if j_acc is not None and j_acc < len(accessors):
+                joint_types.add(accessors[j_acc].get("componentType"))
             targets = prim.get("targets", [])
             morph_count = max(morph_count, len(targets))
             for tgt in targets:
@@ -310,6 +358,10 @@ def inspect_exported_vrm(vrm_path):
                         if "values" in sp and "bufferView" in sp["values"]:
                             morph_bv_indices.add(sp["values"]["bufferView"])
 
+    skins_joints = [len(s.get("joints", [])) for s in gltf.get("skins", [])]
+    j_type_str = ",".join(
+        "u8(5121)" if t == 5121 else f"u16({t})" for t in sorted(joint_types)
+    )
     morph_bytes = sum(bvs[i]["byteLength"] for i in morph_bv_indices if i < len(bvs))
     total_bv_bytes = sum(bv["byteLength"] for bv in bvs)
     geom_bytes = max(0, total_bv_bytes - img_bytes - morph_bytes)
@@ -318,7 +370,8 @@ def inspect_exported_vrm(vrm_path):
         f"   📦 [VRM 体积解剖] 总={total_len / 1048576:.2f} MB | "
         f"基础几何/蒙皮={geom_bytes / 1048576:.2f} MB | "
         f"形态键({morph_count}个)={morph_bytes / 1048576:.2f} MB | "
-        f"贴图({len(img_details)}张)={img_bytes / 1048576:.2f} MB"
+        f"贴图({len(img_details)}张)={img_bytes / 1048576:.2f} MB | "
+        f"蒙皮关节={skins_joints} ({j_type_str})"
     )
 
     vrm_ext = gltf.get("extensions", {}).get("VRMC_vrm", {})
@@ -399,7 +452,9 @@ def run(config):
 
     res = bpy.ops.export_scene.vrm(**export_kwargs)
     if res == {"FINISHED"} and os.path.exists(out_vrm):
-        compact_vrm_morphs_sparse(out_vrm)
+        ensure_vrm_neutral_preset(out_vrm)
+        if config.get("sparse_morphs", False):
+            compact_vrm_morphs_sparse(out_vrm)
         size_mb = os.path.getsize(out_vrm) / (1024 * 1024)
         total_verts = sum(
             len(o.data.vertices)

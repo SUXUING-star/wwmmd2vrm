@@ -22,12 +22,13 @@ Each character directory in `public/` requires a `config.json` next to the `.ble
 
 ```json
 {
-  "jp_name": "莉莉",
-  "en_name": "Lili",
+  "jp_name": "达妮娅",
+  "en_name": "Dania",
   "texture_dir": "TEX",
   "vrma_path": "",
+  "sparse_morphs": false,
   "metadata": {
-    "vrm_name": "Lili",
+    "vrm_name": "Dania",
     "version": "1.0.0",
     "author": "kuro games",
     "copyright": "",
@@ -36,7 +37,7 @@ Each character directory in `public/` requires a `config.json` next to the `.ble
     "third_party_licenses": "None",
     "other_license_url": "",
     "thumbnail_path": "",
-    "avatar_permission": "everyone",
+    "avatar_permission": "onlyAuthor",
     "allow_excessively_violent_usage": false,
     "allow_excessively_sexual_usage": false,
     "commercial_usage": "personalNonProfit",
