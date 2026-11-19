@@ -27,6 +27,7 @@ Each character directory in `public/` requires a `config.json` next to the `.ble
   "texture_dir": "TEX",
   "vrma_path": "",
   "sparse_morphs": false,
+  "fix_high_heel_rig": true,
   "metadata": {
     "vrm_name": "Dania",
     "version": "1.0.0",
