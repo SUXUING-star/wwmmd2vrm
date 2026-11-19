@@ -3,8 +3,7 @@
 
 A Blender Python pipeline for converting MMD models exported from into VRM 1.0 avatars.
 
-The repository is target to Wuthering Waves MMD Models Structure.It's for personal, educational, and non-commercial purposes
----
+The repository is target to Wuthering Waves MMD Models Structure.It's for personal, educational, and non-commercial purposes([related work](https://github.com/SUXUING-star/umammd2vrm))
 
 ---
 
