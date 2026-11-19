@@ -125,6 +125,19 @@ def resolve_disk_path(img, texture_dir):
     return None
 
 
+def image_to_pil_rgba(img_obj, disk_path):
+    if disk_path and os.path.exists(disk_path):
+        return Image.open(disk_path).convert("RGBA")
+    if img_obj and img_obj.has_data and img_obj.size[0] > 0 and img_obj.size[1] > 0:
+        w, h = img_obj.size[0], img_obj.size[1]
+        px = np.array(img_obj.pixels[:], dtype=np.float32).reshape((h, w, 4))
+        px = np.flipud(px)  # Blender 像素自底向上，PIL 自顶向下
+        return Image.fromarray(
+            np.clip(px * 255.0, 0, 255).astype(np.uint8), mode="RGBA"
+        )
+    return None
+
+
 def find_emissive_counterpart(disk_path, texture_dir):
     if not disk_path or not texture_dir or not os.path.exists(texture_dir):
         return None
@@ -201,13 +214,11 @@ def resize_if_needed(pil_img, max_size):
 
 def run(texture_dir, max_tex_size=1024):
     print(
-        f">>> [步骤 4] 优化鸣潮 TEX 贴图（上限 {max_tex_size}px + 不透明转高画质JPEG + 去除双份阴影图）..."
+        f">>> [步骤 4] 优化鸣潮 TEX 贴图（全图上限 {max_tex_size}px + 不透明转JPEG）..."
     )
 
-    if not texture_dir or not os.path.exists(texture_dir):
-        print(f"⚠️ 贴图目录不存在: {texture_dir}，跳过。")
+    if not texture_dir:
         return
-
     temp_dir = os.path.join(texture_dir, "vrm_temp_baked")
     os.makedirs(temp_dir, exist_ok=True)
 
@@ -226,29 +237,23 @@ def run(texture_dir, max_tex_size=1024):
 
     for img_name, (img_obj, role, combined_name) in image_jobs.items():
         disk_path = resolve_disk_path(img_obj, texture_dir)
-        if not disk_path:
-            continue
-
         try:
-            pil_img = Image.open(disk_path).convert("RGBA")
-            # 脸部和眼睛可适当给 1536 上限（不超过 max_tex_size*1.5），其余一律限 max_tex_size
-            target_cap = (
-                min(2048, int(max_tex_size * 1.5))
-                if role in ("face", "eye")
-                else max_tex_size
-            )
-            pil_img = resize_if_needed(pil_img, target_cap)
+            pil_img = image_to_pil_rgba(img_obj, disk_path)
+            if pil_img is None:
+                print(
+                    f"   ⚠️ 无法读取贴图 [{img_name}]（既无磁盘文件也无像素数据），跳过。"
+                )
+                continue
+
+            pil_img = resize_if_needed(pil_img, max_tex_size)
 
             arr = np.array(pil_img, dtype=np.float32)
             arr = maybe_synthesize_black_bg_alpha(arr, role)
             has_alpha, alpha_mode = detect_alpha_mode(arr, role, combined_name)
 
             short_hash = hashlib.md5(img_name.encode("utf-8")).hexdigest()[:6]
-            safe_stem = re.sub(
-                r"[^a-zA-Z0-9_\-]",
-                "_",
-                os.path.splitext(os.path.basename(disk_path))[0],
-            )
+            raw_base = os.path.basename(disk_path) if disk_path else img_name
+            safe_stem = re.sub(r"[^a-zA-Z0-9_\-]", "_", os.path.splitext(raw_base)[0])
             key_prefix = f"ww_{safe_stem}_{short_hash}"
 
             if has_alpha:
@@ -258,13 +263,12 @@ def run(texture_dir, max_tex_size=1024):
                     np.clip(arr, 0, 255).astype(np.uint8), mode="RGBA"
                 ).save(lit_path, format="PNG", optimize=True, compress_level=9)
             else:
-                # 不透明贴图保存为 4:4:4 无色度抽样 JPEG，体积缩小 10~20 倍且保留清晰边缘
                 lit_fname = f"{key_prefix}_lit.jpg"
                 lit_path = os.path.join(temp_dir, lit_fname)
                 Image.fromarray(
                     np.clip(arr[:, :, :3], 0, 255).astype(np.uint8), mode="RGB"
                 ).save(
-                    lit_path, format="JPEG", quality=92, subsampling=0, optimize=True
+                    lit_path, format="JPEG", quality=90, subsampling=0, optimize=True
                 )
 
             emi_fname = None
@@ -277,7 +281,7 @@ def run(texture_dir, max_tex_size=1024):
                 emi_img.save(
                     os.path.join(temp_dir, emi_fname),
                     format="JPEG",
-                    quality=90,
+                    quality=88,
                     subsampling=0,
                     optimize=True,
                 )
@@ -291,7 +295,7 @@ def run(texture_dir, max_tex_size=1024):
             }
             size_kb = os.path.getsize(lit_path) // 1024
             print(
-                f"   ✅ [贴图压缩] {os.path.basename(disk_path)} -> {lit_fname} ({size_kb} KB, alpha={alpha_mode})"
+                f"   ✅ [贴图压缩] {raw_base} -> {lit_fname} ({size_kb} KB, {pil_img.size[0]}x{pil_img.size[1]}, alpha={alpha_mode})"
             )
         except Exception as e:
             print(f"   ⚠️ 贴图 [{img_name}] 处理失败: {e}")

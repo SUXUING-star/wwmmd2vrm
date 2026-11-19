@@ -1,3 +1,5 @@
+import re
+
 import bpy
 
 from step2_expressions import get_armature_and_shape_meshes
@@ -35,15 +37,26 @@ def get_key_weight(key_name: str, is_vrm0: bool) -> float:
     return round(w * 100.0, 2) if is_vrm0 else w
 
 
+def strip_category_prefix(name: str) -> str:
+    s = re.sub(
+        r"^[【\[（(](?:口|嘴|眼|目|眉|顔|脸|表情|lip|mouth|eye|face)[】\]）)]\s*",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"^(?:口|嘴|眼|目|眉|顔|脸|表情)[_\-:\s]+", "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
 def match_keys_in_meshes(
     mesh_objs,
     exact_names=(),
     substrings=(),
     exclude_substrings=(),
-    prefer_first_per_mesh=False,
+    prefer_first_per_mesh=True,
 ):
     results = []
-    exact_low = {e.lower() for e in exact_names}
+    exact_rank = {e.lower(): idx for idx, e in enumerate(exact_names)}
     subs_low = [s.lower() for s in substrings]
     excl_low = [e.lower() for e in exclude_substrings]
 
@@ -53,22 +66,33 @@ def match_keys_in_meshes(
         mesh_hits = []
         for kb in mesh_obj.data.shape_keys.key_blocks:
             k_low = kb.name.lower()
+            k_clean_low = strip_category_prefix(kb.name).lower()
             if k_low in ["basis", "base", "基础", "ベース"]:
                 continue
             if any(ex in k_low for ex in excl_low):
                 continue
 
-            if k_low in exact_low or any(sub in k_low for sub in subs_low):
-                mesh_hits.append(kb.name)
+            if k_low in exact_rank or k_clean_low in exact_rank:
+                rank = exact_rank.get(k_low, exact_rank.get(k_clean_low, 999))
+                mesh_hits.append((0, rank, len(kb.name), kb.name))
+            else:
+                sub_hit = next(
+                    (
+                        idx
+                        for idx, sub in enumerate(subs_low)
+                        if sub in k_low or sub in k_clean_low
+                    ),
+                    None,
+                )
+                if sub_hit is not None:
+                    mesh_hits.append((1, sub_hit, len(kb.name), kb.name))
 
         if mesh_hits:
+            mesh_hits.sort()
             if prefer_first_per_mesh:
-                mesh_hits.sort(
-                    key=lambda n: (0 if n.lower() in exact_low else 1, len(n))
-                )
-                results.append((mesh_obj, mesh_hits[0]))
+                results.append((mesh_obj, mesh_hits[0][3]))
             else:
-                for k_name in mesh_hits:
+                for _, _, _, k_name in mesh_hits:
                     results.append((mesh_obj, k_name))
 
     return results
@@ -133,20 +157,28 @@ def run():
         print("⚠️ 警告：未开启 VRM 插件，跳过绑定。")
         return
 
+    ext.spec_version = "1.0"
+
     lip_a = match_keys_in_meshes(
         mesh_objs,
         exact_names=(
             "あ",
+            "あ1",
             "あ2",
             "A",
             "aa",
+            "ah",
             "Mouth_A",
             "M_A",
             "Lip_A",
             "vrc.v_aa",
             "啊",
+            "阿",
+            "张嘴",
+            "张口",
+            "开口",
         ),
-        substrings=("Mouth_A", "Lip_A", "v_aa", "口_あ", "あ2"),
+        substrings=("Mouth_A", "Lip_A", "v_aa", "口あ", "あ2", "张嘴", "张口", "开口"),
         exclude_substrings=("あご", "あせ", "あわ", "怒", "angry"),
         prefer_first_per_mesh=True,
     )
@@ -154,6 +186,7 @@ def run():
         mesh_objs,
         exact_names=(
             "い",
+            "い1",
             "I",
             "ih",
             "Mouth_I",
@@ -162,8 +195,9 @@ def run():
             "vrc.v_ih",
             "一",
             "衣",
+            "伊",
         ),
-        substrings=("Mouth_I", "Lip_I", "v_ih", "口_い"),
+        substrings=("Mouth_I", "Lip_I", "v_ih", "口い"),
         exclude_substrings=("いろ", "いか", "怒"),
         prefer_first_per_mesh=True,
     )
@@ -171,6 +205,7 @@ def run():
         mesh_objs,
         exact_names=(
             "う",
+            "う1",
             "U",
             "ou",
             "Mouth_U",
@@ -180,7 +215,7 @@ def run():
             "呜",
             "乌",
         ),
-        substrings=("Mouth_U", "Lip_U", "v_ou", "口_う"),
+        substrings=("Mouth_U", "Lip_U", "v_ou", "口う", "嘟嘴"),
         exclude_substrings=("うで", "うら"),
         prefer_first_per_mesh=True,
     )
@@ -188,8 +223,10 @@ def run():
         mesh_objs,
         exact_names=(
             "え",
+            "え1",
             "E",
             "ee",
+            "eh",
             "Mouth_E",
             "M_E",
             "Lip_E",
@@ -197,23 +234,46 @@ def run():
             "哎",
             "诶",
         ),
-        substrings=("Mouth_E", "Lip_E", "v_ee", "口_え"),
+        substrings=("Mouth_E", "Lip_E", "v_ee", "口え"),
         exclude_substrings=("えり", "えがお"),
         prefer_first_per_mesh=True,
     )
     lip_o = match_keys_in_meshes(
         mesh_objs,
-        exact_names=("お", "O", "oh", "Mouth_O", "M_O", "Lip_O", "vrc.v_oh", "哦"),
-        substrings=("Mouth_O", "Lip_O", "v_oh", "口_お"),
+        exact_names=(
+            "お",
+            "お1",
+            "O",
+            "oh",
+            "Mouth_O",
+            "M_O",
+            "Lip_O",
+            "vrc.v_oh",
+            "哦",
+            "喔",
+        ),
+        substrings=("Mouth_O", "Lip_O", "v_oh", "口お"),
         exclude_substrings=("おこ", "おど"),
         prefer_first_per_mesh=True,
     )
 
     blink_all = match_keys_in_meshes(
         mesh_objs,
-        exact_names=("まばたき", "blink", "Eye_Blink", "Eye_Close", "眨眼", "闭眼"),
-        substrings=("まばたき", "Eye_Blink", "Eye_Close", "眨眼", "闭眼"),
+        exact_names=(
+            "まばたき",
+            "まばたき2",
+            "両目",
+            "目閉じ",
+            "blink",
+            "Eye_Blink",
+            "Eye_Close",
+            "眨眼",
+            "闭眼",
+            "双眼",
+        ),
+        substrings=("まばたき", "目閉じ", "Eye_Blink", "Eye_Close", "眨眼", "闭眼"),
         exclude_substrings=("_L", "_R", "右", "左", "left", "right", "笑", "smile"),
+        prefer_first_per_mesh=True,
     )
     blink_l = match_keys_in_meshes(
         mesh_objs,
@@ -221,20 +281,26 @@ def run():
             "ウィンク",
             "ウィンク左",
             "ウインク",
+            "ウインク左",
             "blink_l",
             "blink_left",
+            "wink_l",
             "Eye_Blink_L",
             "左眨眼",
+            "左闭眼",
         ),
         substrings=(
             "ウィンク",
             "ウインク",
             "blink_l",
+            "wink_l",
             "Eye_Blink_L",
             "Eye_Close_L",
             "左眨眼",
+            "左闭眼",
         ),
         exclude_substrings=("右", "_R", "right", "２", "2"),
+        prefer_first_per_mesh=True,
     )
     blink_r = match_keys_in_meshes(
         mesh_objs,
@@ -243,24 +309,31 @@ def run():
             "ウィンク２",
             "ウィンク2",
             "ウインク右",
+            "ウインク２",
+            "ウインク2",
             "blink_r",
             "blink_right",
+            "wink_r",
             "Eye_Blink_R",
             "右眨眼",
+            "右闭眼",
         ),
         substrings=(
             "ウィンク右",
             "ウィンク2",
             "ウィンク２",
             "ウインク右",
+            "ウインク2",
+            "ウインク２",
             "blink_r",
+            "wink_r",
             "Eye_Blink_R",
             "Eye_Close_R",
             "右眨眼",
+            "右闭眼",
         ),
+        prefer_first_per_mesh=True,
     )
-    if not blink_all:
-        blink_all = match_keys_in_meshes(mesh_objs, substrings=("まばたき", "Blink"))
 
     joy_pairs = match_keys_in_meshes(
         mesh_objs,
@@ -268,12 +341,15 @@ def run():
             "笑い",
             "にこり",
             "笑顔",
+            "にっこり",
             "joy",
             "happy",
             "smile",
             "笑",
             "微笑",
+            "笑眼",
             "开心",
+            "高兴",
         ),
         substrings=(
             "笑い",
@@ -282,30 +358,70 @@ def run():
             "Eye_Smile",
             "Happy",
             "Joy",
+            "Smile",
             "开心",
             "微笑",
+            "笑眼",
         ),
+        exclude_substrings=("右", "左", "_L", "_R", "目"),
+        prefer_first_per_mesh=True,
     )
+    if not joy_pairs:
+        joy_pairs = match_keys_in_meshes(
+            mesh_objs,
+            exact_names=("笑い", "にこり", "笑い目"),
+            substrings=("笑い", "にこり"),
+            prefer_first_per_mesh=True,
+        )
+
     angry_pairs = match_keys_in_meshes(
         mesh_objs,
         exact_names=("怒り", "おこ", "angry", "生气", "愤怒", "怒"),
         substrings=("怒り", "おこ", "Angry", "生气", "愤怒"),
+        exclude_substrings=("右", "左", "_L", "_R"),
+        prefer_first_per_mesh=True,
     )
     sorrow_pairs = match_keys_in_meshes(
         mesh_objs,
-        exact_names=("悲しい", "哀", "悲しみ", "sorrow", "sad", "悲伤", "伤心", "难过"),
-        substrings=("悲しい", "悲しみ", "Sorrow", "Sad", "悲伤", "伤心"),
+        exact_names=(
+            "悲しい",
+            "悲しみ",
+            "哀",
+            "困る",
+            "sorrow",
+            "sad",
+            "悲伤",
+            "伤心",
+            "难过",
+            "委屈",
+        ),
+        substrings=("悲しい", "悲しみ", "Sorrow", "Sad", "悲伤", "伤心", "委屈"),
+        exclude_substrings=("右", "左", "_L", "_R"),
+        prefer_first_per_mesh=True,
     )
     fun_pairs = match_keys_in_meshes(
         mesh_objs,
-        exact_names=("楽しい", "楽", "fun", "relaxed", "高兴", "放松"),
-        substrings=("楽しい", "Relax", "Fun"),
-        exclude_substrings=("mouth", "lip", "口"),
+        exact_names=("楽しい", "楽", "fun", "relaxed", "放松", "愉快"),
+        substrings=("楽しい", "Relax", "Fun", "放松"),
+        exclude_substrings=("mouth", "lip", "口", "嘴", "右", "左", "_L", "_R"),
+        prefer_first_per_mesh=True,
     )
     surprised_pairs = match_keys_in_meshes(
         mesh_objs,
-        exact_names=("びっくり", "驚き", "驚", "surprised", "surprise", "惊讶", "吃惊"),
-        substrings=("びっくり", "驚き", "Surprise", "惊讶", "吃惊"),
+        exact_names=(
+            "びっくり",
+            "驚き",
+            "驚",
+            "見開き",
+            "surprised",
+            "surprise",
+            "惊讶",
+            "吃惊",
+            "惊",
+        ),
+        substrings=("びっくり", "驚き", "Surprise", "Shock", "惊讶", "吃惊"),
+        exclude_substrings=("右", "左", "_L", "_R"),
+        prefer_first_per_mesh=True,
     )
 
     STANDARD_MAP_VRM0 = {
@@ -342,7 +458,11 @@ def run():
     }
 
     bound_pairs_set = set()
-    for pairs in STANDARD_MAP_VRM1.values():
+    matched_presets = 0
+    for preset_name, pairs in STANDARD_MAP_VRM1.items():
+        if pairs:
+            matched_presets += 1
+            print(f"   🎭 [映射] {preset_name} -> {[k for _, k in pairs]}")
         for m_obj, k_name in pairs:
             bound_pairs_set.add((m_obj.name, k_name))
 
@@ -400,10 +520,9 @@ def run():
             ext.vrm1.expressions.custom.clear()
 
     print(
-        f"✅ [步骤 3/4] 表情绑定成功！已安全保护并记录 {len(bound_pairs_set)} 个核心表情形态键。"
+        f"✅ [步骤 3/4] 表情绑定完成！共命中 {matched_presets} 个预设，保护 {len(bound_pairs_set)} 个核心形态键。"
     )
 
-    # ------------------ 步骤 3.5 瘦身防卡死清理 ------------------
     print(">>> [步骤 3.5/4] 开始清理未调用的冗余形态键与 NLA 动画...")
 
     valid_mesh_names = {m.name for m in mesh_objs}
@@ -427,7 +546,7 @@ def run():
 
         if keys_to_delete:
             print(
-                f"正在从网格 [{mesh_obj.name}] 彻底清理 {len(keys_to_delete)} 个未使用的冗余形态键..."
+                f"   正在从网格 [{mesh_obj.name}] 清理 {len(keys_to_delete)} 个冗余形态键..."
             )
             for key in keys_to_delete:
                 mesh_obj.shape_key_remove(key)

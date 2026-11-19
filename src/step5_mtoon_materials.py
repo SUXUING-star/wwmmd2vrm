@@ -108,7 +108,6 @@ def run(texture_dir):
 
     converted = 0
     total = 0
-    used_baked_images = set()
 
     for mat in bpy.data.materials:
         if not mat or getattr(mat, "users", 0) == 0:
@@ -141,7 +140,6 @@ def run(texture_dir):
                 lit_img.pack()
             except Exception:
                 pass
-            used_baked_images.add(lit_img.name)
             r, g, b = diffuse_rgb if max(diffuse_rgb) > 0.02 else (1.0, 1.0, 1.0)
             gltf.pbr_metallic_roughness.base_color_factor = (r, g, b, mat_alpha)
             gltf.pbr_metallic_roughness.base_color_texture.index.source = lit_img
@@ -150,7 +148,6 @@ def run(texture_dir):
             gltf.pbr_metallic_roughness.base_color_factor = (r, g, b, mat_alpha)
 
         if emissive_img:
-            used_baked_images.add(emissive_img.name)
             gltf.emissive_texture.index.source = emissive_img
             gltf.emissive_factor = (1.0, 1.0, 1.0)
         else:
@@ -184,7 +181,6 @@ def run(texture_dir):
 
         tint = get_shade_tint_tuple(role)
         if lit_img:
-            # 直接复用 lit_img + shade_color_factor 达到同等阴影染色，节省 50% 贴图体积
             mtoon.shade_multiply_texture.index.source = lit_img
         mtoon.shade_color_factor = (r * tint[0], g * tint[1], b * tint[2])
 
@@ -210,12 +206,15 @@ def run(texture_dir):
             mat.node_tree.update_tag()
         converted += 1
 
-    # 清理不再被引用的原始 2K/4K 大图、toon/spa 图和孤立数据块
+    # 强制移除所有零引用图像与孤立数据块
     try:
         bpy.ops.outliner.orphans_purge(
             do_local_ids=True, do_linked_ids=True, do_recursive=True
         )
     except Exception:
         pass
+    for img in list(bpy.data.images):
+        if img.users == 0:
+            bpy.data.images.remove(img)
 
     print(f"✅ [步骤 5] MToon 1.0 材质转换完成：{converted}/{total} 个材质。")

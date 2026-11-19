@@ -503,7 +503,6 @@ def remove_bone_and_reparent_children(edit_bones, bone):
 
 
 def translate_non_ascii_bone_name(orig_name, mmd_name_e=""):
-    """将剩余的日/中 MMD 附属骨骼名翻译为规范英文"""
     if orig_name.isascii():
         return orig_name
 
@@ -629,11 +628,14 @@ def run(jp_model_name, en_model_name):
     if armature_obj:
         weighted_bones = collect_weighted_bone_names(armature_obj)
 
+        # 先记录 PMX 英文名并彻底清空全部 mmd_tools 骨骼约束，防止删 _shadow_/_dummy_ 时依赖图刷屏报错
         mmd_name_e_map = {}
         for pbone in armature_obj.pose.bones:
             mmd_b = getattr(pbone, "mmd_bone", None)
             if mmd_b and getattr(mmd_b, "name_e", ""):
                 mmd_name_e_map[pbone.name] = mmd_b.name_e
+            for c in list(pbone.constraints):
+                pbone.constraints.remove(c)
 
         bpy.context.view_layer.objects.active = armature_obj
         bpy.ops.object.mode_set(mode="EDIT")
@@ -838,7 +840,6 @@ def run(jp_model_name, en_model_name):
             "rightToes": "ToesR",
             "ball_r": "ToesR",
             "Bip001 R Toe0": "ToesR",
-            # 手指骨骼显式映射（确保全量英文化的同时 VRM Humanoid 可准确绑定）
             "左親指０": "Thumb0L",
             "左親指0": "Thumb0L",
             "Thumb0_L": "Thumb0L",
@@ -1060,15 +1061,6 @@ def run(jp_model_name, en_model_name):
                     pruned_leaf_cnt += 1
 
         bpy.ops.object.mode_set(mode="OBJECT")
-
-        for pbone in armature_obj.pose.bones:
-            for c in list(pbone.constraints):
-                if c.type in ("IK", "DAMPED_TRACK", "LOCKED_TRACK"):
-                    pbone.constraints.remove(c)
-                elif c.type == "COPY_ROTATION" and (
-                    not getattr(c, "subtarget", "") or c.subtarget in bones_to_remove
-                ):
-                    pbone.constraints.remove(c)
 
         existing_bone_names = {b.name for b in armature_obj.data.bones}
         applied_renames = {}

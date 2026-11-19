@@ -14,7 +14,6 @@ import step_vrma
 
 def resolve_config_paths(config):
     blend_dir = bpy.path.abspath("//")
-    project_root = os.path.abspath(os.path.join(blend_dir, "..", ".."))
 
     tex_dir = config.get("texture_dir")
     if not tex_dir:
@@ -24,15 +23,14 @@ def resolve_config_paths(config):
     if not os.path.isabs(tex_dir):
         config["texture_dir"] = os.path.abspath(os.path.join(blend_dir, tex_dir))
 
-    models_dir = config.get("models_dir", "public")
+    # 直接在当前 .blend 所在目录导出（若 config.json 写了相对子目录也基于当前目录）
+    models_dir = config.get("models_dir") or "."
     if not os.path.isabs(models_dir):
-        config["models_dir"] = os.path.abspath(os.path.join(project_root, models_dir))
+        config["models_dir"] = os.path.abspath(os.path.join(blend_dir, models_dir))
 
-    blenders_dir = config.get("blenders_dir", "public")
+    blenders_dir = config.get("blenders_dir") or "."
     if not os.path.isabs(blenders_dir):
-        config["blenders_dir"] = os.path.abspath(
-            os.path.join(project_root, blenders_dir)
-        )
+        config["blenders_dir"] = os.path.abspath(os.path.join(blend_dir, blenders_dir))
 
     meta = config.get("metadata", {})
     thumb = meta.get("thumbnail_path", "")
@@ -63,7 +61,7 @@ def run(config):
     max_tex_size = int(config.get("max_tex_size", 1024))
 
     print(f"\n>>> [wwmmd2vrm] 开始处理鸣潮模型: {jp} -> {en}")
-    print(f"   [路径] 模型/文件根目录: {config['models_dir']}")
+    print(f"   [路径] VRM 导出目录: {config['models_dir']}")
     print(f"   [路径] 贴图绝对路径: {tex} (max_tex_size={max_tex_size})")
 
     step0_clean.run()
