@@ -3,7 +3,7 @@
 
 A Blender Python pipeline for converting MMD models exported from into VRM 1.0 avatars.
 
-The repository is target to Wuthering Waves MMD Models Structure.It's for personal, educational, and non-commercial purposes([related work](https://github.com/SUXUING-star/umammd2vrm))
+The repository is target to Wuthering Waves MMD Models Structure.It's for personal, educational, and non-commercial purposes.([related work](https://github.com/SUXUING-star/umammd2vrm))
 
 ---
 
@@ -27,7 +27,7 @@ Each character directory in `public/` requires a `config.json` next to the `.ble
   "texture_dir": "TEX",
   "vrma_path": "",
   "metadata": {
-    "vrm_name": "Mejiro Bright",
+    "vrm_name": "Lili",
     "version": "1.0.0",
     "author": "suxing-star",
     "vrma_path": ["./motion.vrma"],
