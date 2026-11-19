@@ -1,0 +1,76 @@
+import os
+
+import bpy
+
+import step0_clean
+import step1_skeleton
+import step2_expressions
+import step3_bind_vrm
+import step4_bake_texture
+import step5_mtoon_materials
+import step6_metadata
+import step_vrma
+
+
+def resolve_config_paths(config):
+    blend_dir = bpy.path.abspath("//")
+    project_root = os.path.abspath(os.path.join(blend_dir, "..", ".."))
+
+    tex_dir = config.get("texture_dir")
+    if not tex_dir:
+        tex_dir = (
+            "TEX" if os.path.exists(os.path.join(blend_dir, "TEX")) else "Texture2D"
+        )
+    if not os.path.isabs(tex_dir):
+        config["texture_dir"] = os.path.abspath(os.path.join(blend_dir, tex_dir))
+
+    models_dir = config.get("models_dir", "public")
+    if not os.path.isabs(models_dir):
+        config["models_dir"] = os.path.abspath(os.path.join(project_root, models_dir))
+
+    blenders_dir = config.get("blenders_dir", "public")
+    if not os.path.isabs(blenders_dir):
+        config["blenders_dir"] = os.path.abspath(
+            os.path.join(project_root, blenders_dir)
+        )
+
+    meta = config.get("metadata", {})
+    thumb = meta.get("thumbnail_path", "")
+    if thumb and not os.path.isabs(thumb):
+        meta["thumbnail_path"] = os.path.abspath(os.path.join(blend_dir, thumb))
+
+    vrma = config.get("vrma_path", "")
+    if vrma and not os.path.isabs(vrma):
+        config["vrma_path"] = os.path.abspath(os.path.join(blend_dir, vrma))
+
+    if isinstance(config.get("vrma_paths"), list):
+        config["vrma_paths"] = [
+            os.path.abspath(os.path.join(blend_dir, p))
+            if p and not os.path.isabs(p)
+            else p
+            for p in config["vrma_paths"]
+        ]
+
+    return config
+
+
+def run(config):
+    config = resolve_config_paths(config)
+
+    jp = config["jp_name"]
+    en = config["en_name"]
+    tex = config["texture_dir"]
+    max_tex_size = int(config.get("max_tex_size", 1024))
+
+    print(f"\n>>> [wwmmd2vrm] 开始处理鸣潮模型: {jp} -> {en}")
+    print(f"   [路径] 模型/文件根目录: {config['models_dir']}")
+    print(f"   [路径] 贴图绝对路径: {tex} (max_tex_size={max_tex_size})")
+
+    step0_clean.run()
+    step1_skeleton.run(jp, en)
+    step2_expressions.run()
+    step3_bind_vrm.run()
+    step4_bake_texture.run(tex, max_tex_size=max_tex_size)
+    step5_mtoon_materials.run(tex)
+    step_vrma.run(config)
+    step6_metadata.run(config)
