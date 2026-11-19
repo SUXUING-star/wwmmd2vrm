@@ -48,7 +48,6 @@ def restore_custom_normals(mesh, kd, orig_loop_normals):
 
 
 def classify_poly_surface(obj_name_low, mat_name_low):
-    """按材质名区分鸣潮模型需要法线重构的区域"""
     target = mat_name_low or obj_name_low
 
     EXCLUDE_KW = (
@@ -454,32 +453,35 @@ def run():
             except Exception:
                 pass
 
-        kd, orig_loop_normals = None, None
-        try:
-            kd, orig_loop_normals = snapshot_custom_normals(obj.data)
-        except Exception as e:
-            print(f"   ⚠️ 网格 [{obj.name}] 法线备份跳过: {e}")
+        has_shape_keys = bool(
+            obj.data.shape_keys and len(obj.data.shape_keys.key_blocks) > 1
+        )
 
-        try:
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.mode_set(mode="EDIT")
-            bpy.ops.mesh.select_all(action="SELECT")
-            if not obj.data.shape_keys or len(obj.data.shape_keys.key_blocks) <= 1:
-                bpy.ops.mesh.remove_doubles(threshold=0.00005)
-            bpy.ops.mesh.dissolve_degenerate(threshold=0.0001)
-            bpy.ops.object.mode_set(mode="OBJECT")
-        except Exception as e:
-            print(f"   ⚠️ 网格 [{obj.name}] 几何清理跳过: {e}")
+        # 关键修复：含形态键的网格严禁 remove_doubles 或 dissolve_degenerate，防止删掉嘴角/眼睑折叠微面导致表情黑角穿帮
+        if not has_shape_keys:
+            kd, orig_loop_normals = None, None
             try:
-                bpy.ops.object.mode_set(mode="OBJECT")
+                kd, orig_loop_normals = snapshot_custom_normals(obj.data)
             except Exception:
                 pass
-
-        if kd is not None and orig_loop_normals:
             try:
-                restore_custom_normals(obj.data, kd, orig_loop_normals)
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.object.mode_set(mode="EDIT")
+                bpy.ops.mesh.select_all(action="SELECT")
+                bpy.ops.mesh.remove_doubles(threshold=0.00005)
+                bpy.ops.mesh.dissolve_degenerate(threshold=0.0001)
+                bpy.ops.object.mode_set(mode="OBJECT")
             except Exception as e:
-                print(f"   ⚠️ 网格 [{obj.name}] 法线还原跳过: {e}")
+                print(f"   ⚠️ 网格 [{obj.name}] 几何清理跳过: {e}")
+                try:
+                    bpy.ops.object.mode_set(mode="OBJECT")
+                except Exception:
+                    pass
+            if kd is not None and orig_loop_normals:
+                try:
+                    restore_custom_normals(obj.data, kd, orig_loop_normals)
+                except Exception:
+                    pass
 
         try:
             bpy.context.view_layer.objects.active = obj

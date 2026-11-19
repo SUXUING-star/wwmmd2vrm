@@ -8,8 +8,8 @@ def to_snake_case(name: str) -> str:
 
 
 def collect_weighted_bone_names(armature_obj):
-    """统计所有网格中真正有蒙皮权重 (>0) 的顶点组名称"""
-    weighted = set()
+    """统计所有网格中真正有蒙皮权重 (>0) 的顶点组名称 -> 顶点数量"""
+    weighted = {}
     for obj in bpy.data.objects:
         if obj.type != "MESH" or not obj.data:
             continue
@@ -20,14 +20,11 @@ def collect_weighted_bone_names(armature_obj):
             continue
 
         idx_to_name = {vg.index: vg.name for vg in obj.vertex_groups}
-        used_indices = set()
         for v in obj.data.vertices:
             for g in v.groups:
-                if g.weight > 0.0001:
-                    used_indices.add(g.group)
-        for idx in used_indices:
-            if idx in idx_to_name:
-                weighted.add(idx_to_name[idx])
+                if g.weight > 0.0001 and g.group in idx_to_name:
+                    bname = idx_to_name[g.group]
+                    weighted[bname] = weighted.get(bname, 0) + 1
     return weighted
 
 
@@ -467,6 +464,7 @@ def auto_assign_vrm_humanoid(armature_obj):
                         hb.node.bone_name = candidate
                         break
 
+    assigned_vrm1 = {}
     if hasattr(ext, "vrm1") and hasattr(ext.vrm1, "humanoid"):
         h_bones = ext.vrm1.humanoid.human_bones
         for attr_name, candidates in map_vrm1.items():
@@ -483,7 +481,9 @@ def auto_assign_vrm_humanoid(armature_obj):
                 if candidate in armature_obj.data.bones:
                     if hasattr(hb_item, "node"):
                         hb_item.node.bone_name = candidate
+                        assigned_vrm1[attr_name] = candidate
                     break
+    return assigned_vrm1
 
 
 def is_ancestor(bone, maybe_ancestor):
@@ -585,6 +585,29 @@ def translate_non_ascii_bone_name(orig_name, mmd_name_e=""):
     return trans or "AuxBone"
 
 
+def safe_rename_bone(armature_obj, bone, new_name, existing_names):
+    """改名骨骼，并仅在 Blender 未自动同步顶点组时补同步（避免二次改名串位）"""
+    old_name = bone.name
+    if old_name == new_name or new_name in existing_names:
+        return False
+
+    bone.name = new_name
+    existing_names.discard(old_name)
+    existing_names.add(bone.name)
+
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or not obj.vertex_groups:
+            continue
+        bound = obj.parent == armature_obj or any(
+            m.type == "ARMATURE" and m.object == armature_obj for m in obj.modifiers
+        )
+        if not bound:
+            continue
+        if old_name in obj.vertex_groups and bone.name not in obj.vertex_groups:
+            obj.vertex_groups[old_name].name = bone.name
+    return True
+
+
 def run(jp_model_name, en_model_name):
     GARBAGE_BONE_KEYWORDS = [
         "Pole",
@@ -621,14 +644,13 @@ def run(jp_model_name, en_model_name):
         "Groove2",
     }
 
-    print(">>> [步骤 1] 规整鸣潮 MMD 骨骼命名、D-Bone 识别与层级拍平...")
+    print(">>> [步骤 1] 规整鸣潮 MMD 骨骼命名、权重核验与层级拍平...")
     armature_obj = next(
         (obj for obj in bpy.data.objects if obj.type == "ARMATURE"), None
     )
     if armature_obj:
         weighted_bones = collect_weighted_bone_names(armature_obj)
 
-        # 先记录 PMX 英文名并彻底清空全部 mmd_tools 骨骼约束，防止删 _shadow_/_dummy_ 时依赖图刷屏报错
         mmd_name_e_map = {}
         for pbone in armature_obj.pose.bones:
             mmd_b = getattr(pbone, "mmd_bone", None)
@@ -641,16 +663,29 @@ def run(jp_model_name, en_model_name):
         bpy.ops.object.mode_set(mode="EDIT")
         edit_bones = armature_obj.data.edit_bones
 
-        has_left_leg_d = "左足D" in edit_bones
-        has_right_leg_d = "右足D" in edit_bones
-        has_left_arm_d = "左腕D" in edit_bones
-        has_right_arm_d = "右腕D" in edit_bones
+        # 按真实蒙皮权重来判定腿/臂是用 D-Bone 还是普通骨
+        has_left_leg_d = ("左足D" in edit_bones) and (
+            weighted_bones.get("左足D", 0) >= weighted_bones.get("左足", 0)
+        )
+        has_right_leg_d = ("右足D" in edit_bones) and (
+            weighted_bones.get("右足D", 0) >= weighted_bones.get("右足", 0)
+        )
+        has_left_arm_d = ("左腕D" in edit_bones) and (
+            weighted_bones.get("左腕D", 0) >= weighted_bones.get("左腕", 0)
+        )
+        has_right_arm_d = ("右腕D" in edit_bones) and (
+            weighted_bones.get("右腕D", 0) >= weighted_bones.get("右腕", 0)
+        )
 
+        # 绝对保护所有带权重的骨骼！只删真正的 0 权重废骨/IK骨
         bones_to_remove = {
             b.name
             for b in edit_bones
-            if any(kw in b.name for kw in GARBAGE_BONE_KEYWORDS)
-            or b.name.endswith("IK")
+            if (
+                any(kw in b.name for kw in GARBAGE_BONE_KEYWORDS)
+                or b.name.endswith("IK")
+            )
+            and b.name not in weighted_bones
         }
 
         if has_left_leg_d:
@@ -1063,7 +1098,7 @@ def run(jp_model_name, en_model_name):
         bpy.ops.object.mode_set(mode="OBJECT")
 
         existing_bone_names = {b.name for b in armature_obj.data.bones}
-        applied_renames = {}
+        renamed_count = 0
 
         for bone in list(armature_obj.data.bones):
             target = CUSTOM_BONE_MAP.get(bone.name)
@@ -1073,16 +1108,14 @@ def run(jp_model_name, en_model_name):
                 occupant = armature_obj.data.bones.get(target)
                 if occupant and occupant.name not in CUSTOM_BONE_MAP:
                     tmp_name = f"Aux_{target}_old"
-                    occupant.name = tmp_name
-                    existing_bone_names.discard(target)
-                    existing_bone_names.add(tmp_name)
-                    applied_renames[target] = tmp_name
-            if target not in existing_bone_names:
-                old_name = bone.name
-                bone.name = target
-                existing_bone_names.discard(old_name)
-                existing_bone_names.add(target)
-                applied_renames[old_name] = target
+                    while tmp_name in existing_bone_names:
+                        tmp_name += "_"
+                    if safe_rename_bone(
+                        armature_obj, occupant, tmp_name, existing_bone_names
+                    ):
+                        renamed_count += 1
+            if safe_rename_bone(armature_obj, bone, target, existing_bone_names):
+                renamed_count += 1
 
         for bone in list(armature_obj.data.bones):
             if bone.name.isascii():
@@ -1096,30 +1129,34 @@ def run(jp_model_name, en_model_name):
             while cand in existing_bone_names and cand != old_name:
                 cand = f"{base_en}_{idx}"
                 idx += 1
-            if cand != old_name:
-                bone.name = cand
-                existing_bone_names.discard(old_name)
-                existing_bone_names.add(cand)
-                applied_renames[old_name] = cand
+            if safe_rename_bone(armature_obj, bone, cand, existing_bone_names):
+                renamed_count += 1
 
-        for child in bpy.data.objects:
-            if child.type == "MESH" and (
-                child.parent == armature_obj
-                or any(
-                    m.type == "ARMATURE" and m.object == armature_obj
-                    for m in child.modifiers
-                )
-            ):
-                for vg in child.vertex_groups:
-                    if vg.name in applied_renames:
-                        vg.name = applied_renames[vg.name]
-
-        auto_assign_vrm_humanoid(armature_obj)
+        assigned = auto_assign_vrm_humanoid(armature_obj) or {}
+        final_weights = collect_weighted_bone_names(armature_obj)
+        core_check = {
+            k: f"{assigned.get(k)}({final_weights.get(assigned.get(k), 0)}v)"
+            for k in (
+                "hips",
+                "spine",
+                "chest",
+                "upperChest",
+                "head",
+                "leftUpperArm",
+                "rightUpperArm",
+                "leftUpperLeg",
+                "rightUpperLeg",
+                "leftLowerLeg",
+                "rightLowerLeg",
+            )
+            if k in assigned
+        }
         print(
             f"   🦴 骨骼处理完成：保留 {len(armature_obj.data.bones)} 根骨骼，"
             f"清理 {len(bones_to_remove)} 根控制/IK骨 + {pruned_leaf_cnt} 根零权重末端骨，"
-            f"完成 {len(applied_renames)} 个骨骼与顶点组英文化。"
+            f"完成 {renamed_count} 个骨骼安全重命名。"
         )
+        print(f"   ⚖️ [核心骨骼权重核验] {core_check}")
 
     for obj in bpy.data.objects:
         if jp_model_name in obj.name and not re.search(r"\.\d+$", obj.name):

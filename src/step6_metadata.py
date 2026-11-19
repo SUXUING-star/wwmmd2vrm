@@ -18,7 +18,7 @@ TYPE_COUNT = {
 
 
 def compact_vrm_morphs_sparse(vrm_path):
-    """将 VRM(GLB) 中稠密 Morph Target 转为标准 glTF 2.0 Sparse，并按存活数据精确重建 BIN 块"""
+    """将 VRM(GLB) 中稠密 Morph Target 转为标准 glTF 2.0 Sparse，按存活数据精确重建 BIN，并补全 neutral 预设"""
     with open(vrm_path, "rb") as f:
         data = f.read()
 
@@ -43,6 +43,22 @@ def compact_vrm_morphs_sparse(vrm_path):
         return
 
     gltf = json.loads(json_bytes.decode("utf-8"))
+
+    # 确保 VRM 1.0 preset 里显式包含 neutral
+    vrm_ext = gltf.get("extensions", {}).get("VRMC_vrm")
+    if isinstance(vrm_ext, dict):
+        exprs = vrm_ext.setdefault("expressions", {})
+        preset = exprs.setdefault("preset", {})
+        preset.setdefault(
+            "neutral",
+            {
+                "isBinary": False,
+                "overrideBlink": "none",
+                "overrideLookAt": "none",
+                "overrideMouth": "none",
+            },
+        )
+
     bvs = gltf.get("bufferViews", [])
     accessors = gltf.get("accessors", [])
 
@@ -53,10 +69,6 @@ def compact_vrm_morphs_sparse(vrm_path):
                 for acc_idx in tgt.values():
                     morph_acc_indices.add(acc_idx)
 
-    if not morph_acc_indices:
-        return
-
-    # 1. 将所有稠密 Morph Accessor 转成 sparse 数据块
     new_sparse_chunks = []
     for acc_idx in sorted(morph_acc_indices):
         acc = accessors[acc_idx]
@@ -107,137 +119,130 @@ def compact_vrm_morphs_sparse(vrm_path):
             (acc, len(nz_indices), idx_comp_type, idx_bytes, val_bytes)
         )
 
-    if not new_sparse_chunks:
-        return
+    if new_sparse_chunks:
+        out_bin = bytearray()
+        new_bvs = []
 
-    # 2. 按存活引用精确重建 BIN（彻底剥离共享 bufferView 里已废弃的稠密形态键字节）
-    out_bin = bytearray()
-    new_bvs = []
+        def append_aligned(chunk_bytes):
+            while len(out_bin) % 4 != 0:
+                out_bin.append(0)
+            off = len(out_bin)
+            out_bin.extend(chunk_bytes)
+            return off, len(chunk_bytes)
 
-    def append_aligned(chunk_bytes):
-        while len(out_bin) % 4 != 0:
-            out_bin.append(0)
-        off = len(out_bin)
-        out_bin.extend(chunk_bytes)
-        return off, len(chunk_bytes)
+        for im in gltf.get("images", []):
+            if "bufferView" not in im:
+                continue
+            old_bv = bvs[im["bufferView"]]
+            old_off = old_bv.get("byteOffset", 0)
+            old_len = old_bv["byteLength"]
+            new_off, new_len = append_aligned(bin_bytes[old_off : old_off + old_len])
+            im["bufferView"] = len(new_bvs)
+            new_bvs.append({"buffer": 0, "byteOffset": new_off, "byteLength": new_len})
 
-    # 2a. 复制全部贴图 bufferView
-    for im in gltf.get("images", []):
-        if "bufferView" not in im:
-            continue
-        old_bv = bvs[im["bufferView"]]
-        old_off = old_bv.get("byteOffset", 0)
-        old_len = old_bv["byteLength"]
-        new_off, new_len = append_aligned(bin_bytes[old_off : old_off + old_len])
-        im["bufferView"] = len(new_bvs)
-        bv_obj = {"buffer": 0, "byteOffset": new_off, "byteLength": new_len}
-        new_bvs.append(bv_obj)
+        for acc in accessors:
+            if "sparse" not in acc:
+                continue
+            sp = acc["sparse"]
+            for key in ("indices", "values"):
+                if key in sp and "bufferView" in sp[key]:
+                    old_bv = bvs[sp[key]["bufferView"]]
+                    old_off = old_bv.get("byteOffset", 0)
+                    old_len = old_bv["byteLength"]
+                    new_off, new_len = append_aligned(
+                        bin_bytes[old_off : old_off + old_len]
+                    )
+                    sp[key]["bufferView"] = len(new_bvs)
+                    new_bvs.append(
+                        {"buffer": 0, "byteOffset": new_off, "byteLength": new_len}
+                    )
 
-    # 2b. 复制原已存在的 sparse 辅助 bufferView（若有）
-    for acc in accessors:
-        if "sparse" not in acc:
-            continue
-        sp = acc["sparse"]
-        for key in ("indices", "values"):
-            if key in sp and "bufferView" in sp[key]:
-                old_bv = bvs[sp[key]["bufferView"]]
-                old_off = old_bv.get("byteOffset", 0)
-                old_len = old_bv["byteLength"]
-                new_off, new_len = append_aligned(
-                    bin_bytes[old_off : old_off + old_len]
+        bv_to_accs = {}
+        for acc in accessors:
+            if "bufferView" in acc:
+                bv_to_accs.setdefault(acc["bufferView"], []).append(acc)
+
+        for old_bv_idx, acc_list in bv_to_accs.items():
+            old_bv = bvs[old_bv_idx]
+            old_bv_off = old_bv.get("byteOffset", 0)
+            stride = old_bv.get("byteStride")
+            target = old_bv.get("target")
+
+            is_interleaved = False
+            if stride:
+                for acc in acc_list:
+                    elem_sz = COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
+                    if stride > elem_sz:
+                        is_interleaved = True
+                        break
+
+            if is_interleaved:
+                min_off = min(acc.get("byteOffset", 0) for acc in acc_list)
+                max_end = max(
+                    acc.get("byteOffset", 0)
+                    + (acc["count"] - 1) * stride
+                    + COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
+                    for acc in acc_list
                 )
-                sp[key]["bufferView"] = len(new_bvs)
-                new_bvs.append(
-                    {"buffer": 0, "byteOffset": new_off, "byteLength": new_len}
-                )
-
-    # 2c. 复制全部存活非 morph Accessor（分别处理非交错与交错 bufferView）
-    bv_to_accs = {}
-    for acc in accessors:
-        if "bufferView" in acc:
-            bv_to_accs.setdefault(acc["bufferView"], []).append(acc)
-
-    for old_bv_idx, acc_list in bv_to_accs.items():
-        old_bv = bvs[old_bv_idx]
-        old_bv_off = old_bv.get("byteOffset", 0)
-        stride = old_bv.get("byteStride")
-        target = old_bv.get("target")
-
-        # 检查是否为真正的交错访问（byteStride > 单个元素字节数）
-        is_interleaved = False
-        if stride:
-            for acc in acc_list:
-                elem_sz = COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
-                if stride > elem_sz:
-                    is_interleaved = True
-                    break
-
-        if is_interleaved:
-            min_off = min(acc.get("byteOffset", 0) for acc in acc_list)
-            max_end = max(
-                acc.get("byteOffset", 0)
-                + (acc["count"] - 1) * stride
-                + COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
-                for acc in acc_list
-            )
-            new_off, new_len = append_aligned(
-                bin_bytes[old_bv_off + min_off : old_bv_off + max_end]
-            )
-            new_bv_idx = len(new_bvs)
-            bv_obj = {
-                "buffer": 0,
-                "byteOffset": new_off,
-                "byteLength": new_len,
-                "byteStride": stride,
-            }
-            if target is not None:
-                bv_obj["target"] = target
-            new_bvs.append(bv_obj)
-            for acc in acc_list:
-                acc["bufferView"] = new_bv_idx
-                new_acc_off = acc.get("byteOffset", 0) - min_off
-                if new_acc_off > 0:
-                    acc["byteOffset"] = new_acc_off
-                else:
-                    acc.pop("byteOffset", None)
-        else:
-            for acc in acc_list:
-                elem_sz = COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
-                acc_len = acc["count"] * elem_sz
-                acc_start = old_bv_off + acc.get("byteOffset", 0)
                 new_off, new_len = append_aligned(
-                    bin_bytes[acc_start : acc_start + acc_len]
+                    bin_bytes[old_bv_off + min_off : old_bv_off + max_end]
                 )
                 new_bv_idx = len(new_bvs)
-                bv_obj = {"buffer": 0, "byteOffset": new_off, "byteLength": new_len}
+                bv_obj = {
+                    "buffer": 0,
+                    "byteOffset": new_off,
+                    "byteLength": new_len,
+                    "byteStride": stride,
+                }
                 if target is not None:
                     bv_obj["target"] = target
                 new_bvs.append(bv_obj)
-                acc["bufferView"] = new_bv_idx
-                acc.pop("byteOffset", None)
+                for acc in acc_list:
+                    acc["bufferView"] = new_bv_idx
+                    new_acc_off = acc.get("byteOffset", 0) - min_off
+                    if new_acc_off > 0:
+                        acc["byteOffset"] = new_acc_off
+                    else:
+                        acc.pop("byteOffset", None)
+            else:
+                for acc in acc_list:
+                    elem_sz = COMP_SIZE[acc["componentType"]] * TYPE_COUNT[acc["type"]]
+                    acc_len = acc["count"] * elem_sz
+                    acc_start = old_bv_off + acc.get("byteOffset", 0)
+                    new_off, new_len = append_aligned(
+                        bin_bytes[acc_start : acc_start + acc_len]
+                    )
+                    new_bv_idx = len(new_bvs)
+                    bv_obj = {"buffer": 0, "byteOffset": new_off, "byteLength": new_len}
+                    if target is not None:
+                        bv_obj["target"] = target
+                    new_bvs.append(bv_obj)
+                    acc["bufferView"] = new_bv_idx
+                    acc.pop("byteOffset", None)
 
-    # 2d. 追加新的紧凑 sparse 索引与增量值
-    for acc, sp_count, idx_comp_type, idx_bytes, val_bytes in new_sparse_chunks:
-        idx_off, idx_len = append_aligned(idx_bytes)
-        idx_bv = len(new_bvs)
-        new_bvs.append({"buffer": 0, "byteOffset": idx_off, "byteLength": idx_len})
+        for acc, sp_count, idx_comp_type, idx_bytes, val_bytes in new_sparse_chunks:
+            idx_off, idx_len = append_aligned(idx_bytes)
+            idx_bv = len(new_bvs)
+            new_bvs.append({"buffer": 0, "byteOffset": idx_off, "byteLength": idx_len})
 
-        val_off, val_len = append_aligned(val_bytes)
-        val_bv = len(new_bvs)
-        new_bvs.append({"buffer": 0, "byteOffset": val_off, "byteLength": val_len})
+            val_off, val_len = append_aligned(val_bytes)
+            val_bv = len(new_bvs)
+            new_bvs.append({"buffer": 0, "byteOffset": val_off, "byteLength": val_len})
 
-        acc["sparse"] = {
-            "count": sp_count,
-            "indices": {"bufferView": idx_bv, "componentType": idx_comp_type},
-            "values": {"bufferView": val_bv},
-        }
+            acc["sparse"] = {
+                "count": sp_count,
+                "indices": {"bufferView": idx_bv, "componentType": idx_comp_type},
+                "values": {"bufferView": val_bv},
+            }
 
-    while len(out_bin) % 4 != 0:
-        out_bin.append(0)
+        while len(out_bin) % 4 != 0:
+            out_bin.append(0)
 
-    gltf["bufferViews"] = new_bvs
-    if gltf.get("buffers"):
-        gltf["buffers"][0]["byteLength"] = len(out_bin)
+        gltf["bufferViews"] = new_bvs
+        if gltf.get("buffers"):
+            gltf["buffers"][0]["byteLength"] = len(out_bin)
+    else:
+        out_bin = bin_bytes
 
     new_json = json.dumps(gltf, separators=(",", ":"), ensure_ascii=False).encode(
         "utf-8"
@@ -315,20 +320,15 @@ def inspect_exported_vrm(vrm_path):
         f"形态键({morph_count}个)={morph_bytes / 1048576:.2f} MB | "
         f"贴图({len(img_details)}张)={img_bytes / 1048576:.2f} MB"
     )
-    if img_details:
-        top5 = [
-            (round(sz / 1048576, 2), name, mime) for sz, name, mime in img_details[:5]
-        ]
-        print(f"   🖼️ [前5大贴图] {top5}")
 
     vrm_ext = gltf.get("extensions", {}).get("VRMC_vrm", {})
     preset_exprs = vrm_ext.get("expressions", {}).get("preset", {})
     bound_summary = {
-        k: len(v.get("morphTargetBinds", []))
-        for k, v in preset_exprs.items()
-        if v.get("morphTargetBinds")
+        k: len(v.get("morphTargetBinds", [])) for k, v in preset_exprs.items()
     }
-    print(f"   😊 [VRM 导出表情验证] 已写入绑定: {bound_summary}")
+    print(
+        f"   😊 [VRM 导出表情验证] 全部已注册预设({len(bound_summary)}个): {bound_summary}"
+    )
 
 
 def run(config):
@@ -379,39 +379,37 @@ def run(config):
 
     print("✅ [步骤 6] 元数据写入完成。")
 
-    models_dir = config.get("models_dir")
-    if models_dir:
-        os.makedirs(models_dir, exist_ok=True)
-        out_vrm = os.path.join(models_dir, f"{config['en_name']}.vrm")
-        has_vrma = bool(
-            config.get("vrma_path")
-            or (
-                isinstance(config.get("vrma_paths"), list)
-                and any(config.get("vrma_paths"))
-            )
+    models_dir = config.get("models_dir") or bpy.path.abspath("//")
+    os.makedirs(models_dir, exist_ok=True)
+    out_vrm = os.path.join(models_dir, f"{config['en_name']}.vrm")
+    has_vrma = bool(
+        config.get("vrma_path")
+        or (
+            isinstance(config.get("vrma_paths"), list) and any(config.get("vrma_paths"))
         )
+    )
 
-        export_kwargs = {
-            "filepath": out_vrm,
-            "armature_object_name": armature.name,
-        }
-        if has_vrma:
-            export_kwargs["enable_advanced_preferences"] = True
-            export_kwargs["export_gltf_animations"] = True
+    export_kwargs = {
+        "filepath": out_vrm,
+        "armature_object_name": armature.name,
+    }
+    if has_vrma:
+        export_kwargs["enable_advanced_preferences"] = True
+        export_kwargs["export_gltf_animations"] = True
 
-        res = bpy.ops.export_scene.vrm(**export_kwargs)
-        if res == {"FINISHED"} and os.path.exists(out_vrm):
-            compact_vrm_morphs_sparse(out_vrm)
-            size_mb = os.path.getsize(out_vrm) / (1024 * 1024)
-            total_verts = sum(
-                len(o.data.vertices)
-                for o in bpy.data.objects
-                if o.type == "MESH" and o.data
-            )
-            print(
-                f"✅ [步骤 6] VRM 已导出至: {out_vrm} "
-                f"(体积: {size_mb:.2f} MB | 骨骼: {len(armature.data.bones)} | 顶点: {total_verts} | 内嵌动画: {has_vrma})"
-            )
-            inspect_exported_vrm(out_vrm)
-        else:
-            print(f"⚠️ [步骤 6] VRM 导出失败: {res}")
+    res = bpy.ops.export_scene.vrm(**export_kwargs)
+    if res == {"FINISHED"} and os.path.exists(out_vrm):
+        compact_vrm_morphs_sparse(out_vrm)
+        size_mb = os.path.getsize(out_vrm) / (1024 * 1024)
+        total_verts = sum(
+            len(o.data.vertices)
+            for o in bpy.data.objects
+            if o.type == "MESH" and o.data
+        )
+        print(
+            f"✅ [步骤 6] VRM 已导出至: {out_vrm} "
+            f"(体积: {size_mb:.2f} MB | 骨骼: {len(armature.data.bones)} | 顶点: {total_verts} | 内嵌动画: {has_vrma})"
+        )
+        inspect_exported_vrm(out_vrm)
+    else:
+        print(f"⚠️ [步骤 6] VRM 导出失败: {res}")

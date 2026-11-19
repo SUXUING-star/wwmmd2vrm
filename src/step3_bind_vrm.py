@@ -53,12 +53,14 @@ def match_keys_in_meshes(
     exact_names=(),
     substrings=(),
     exclude_substrings=(),
+    exclude_exact=(),
     prefer_first_per_mesh=True,
 ):
     results = []
     exact_rank = {e.lower(): idx for idx, e in enumerate(exact_names)}
     subs_low = [s.lower() for s in substrings]
     excl_low = [e.lower() for e in exclude_substrings]
+    excl_exact_low = {e.lower() for e in exclude_exact}
 
     for mesh_obj in mesh_objs:
         if not mesh_obj.data or not mesh_obj.data.shape_keys:
@@ -68,6 +70,8 @@ def match_keys_in_meshes(
             k_low = kb.name.lower()
             k_clean_low = strip_category_prefix(kb.name).lower()
             if k_low in ["basis", "base", "基础", "ベース"]:
+                continue
+            if k_low in excl_exact_low or k_clean_low in excl_exact_low:
                 continue
             if any(ex in k_low for ex in excl_low):
                 continue
@@ -158,6 +162,14 @@ def run():
         return
 
     ext.spec_version = "1.0"
+
+    all_keys = [
+        kb.name
+        for m in mesh_objs
+        for kb in m.data.shape_keys.key_blocks
+        if kb.name.lower() not in ("basis", "base", "基础", "ベース")
+    ]
+    print(f"   📝 [原始形态键总览({len(all_keys)}个)] {all_keys}")
 
     lip_a = match_keys_in_meshes(
         mesh_objs,
@@ -335,33 +347,32 @@ def run():
         prefer_first_per_mesh=True,
     )
 
+    # happy 优先选 笑い / 笑顔 / happy；若 笑い 有嘴角异常可后续切为 にこり + 口角上げ
     joy_pairs = match_keys_in_meshes(
         mesh_objs,
         exact_names=(
             "笑い",
-            "にこり",
             "笑顔",
+            "にこり",
             "にっこり",
-            "joy",
             "happy",
+            "joy",
             "smile",
             "笑",
             "微笑",
-            "笑眼",
             "开心",
             "高兴",
         ),
         substrings=(
             "笑い",
-            "にこり",
             "笑顔",
+            "にこり",
             "Eye_Smile",
             "Happy",
             "Joy",
             "Smile",
             "开心",
             "微笑",
-            "笑眼",
         ),
         exclude_substrings=("右", "左", "_L", "_R", "目"),
         prefer_first_per_mesh=True,
@@ -369,10 +380,57 @@ def run():
     if not joy_pairs:
         joy_pairs = match_keys_in_meshes(
             mesh_objs,
-            exact_names=("笑い", "にこり", "笑い目"),
+            exact_names=("笑い目", "にこり"),
             substrings=("笑い", "にこり"),
             prefer_first_per_mesh=True,
         )
+    joy_used = [k for _, k in joy_pairs]
+
+    # relaxed 优先匹配 楽しい/楽/ほほえみ/微笑み，若无则使用未给 happy 用过的 にこり / 笑い目（禁用易穿模黑眼的 なごみ）
+    fun_pairs = match_keys_in_meshes(
+        mesh_objs,
+        exact_names=(
+            "楽しい",
+            "楽",
+            "ほほえみ",
+            "微笑み",
+            "微笑",
+            "にこり",
+            "にこり2",
+            "にっこり",
+            "笑い目",
+            "うっとり",
+            "relaxed",
+            "fun",
+            "relax",
+            "calm",
+            "放松",
+            "愉快",
+        ),
+        substrings=(
+            "楽しい",
+            "ほほえみ",
+            "微笑",
+            "にこり",
+            "うっとり",
+            "Relax",
+            "Fun",
+            "放松",
+        ),
+        exclude_substrings=(
+            "mouth",
+            "lip",
+            "口",
+            "嘴",
+            "右",
+            "左",
+            "_L",
+            "_R",
+            "なごみ",
+        ),
+        exclude_exact=joy_used,
+        prefer_first_per_mesh=True,
+    )
 
     angry_pairs = match_keys_in_meshes(
         mesh_objs,
@@ -395,15 +453,17 @@ def run():
             "难过",
             "委屈",
         ),
-        substrings=("悲しい", "悲しみ", "Sorrow", "Sad", "悲伤", "伤心", "委屈"),
+        substrings=(
+            "悲しい",
+            "悲しみ",
+            "Sorrow",
+            "Sad",
+            "悲伤",
+            "伤心",
+            "委屈",
+            "困る",
+        ),
         exclude_substrings=("右", "左", "_L", "_R"),
-        prefer_first_per_mesh=True,
-    )
-    fun_pairs = match_keys_in_meshes(
-        mesh_objs,
-        exact_names=("楽しい", "楽", "fun", "relaxed", "放松", "愉快"),
-        substrings=("楽しい", "Relax", "Fun", "放松"),
-        exclude_substrings=("mouth", "lip", "口", "嘴", "右", "左", "_L", "_R"),
         prefer_first_per_mesh=True,
     )
     surprised_pairs = match_keys_in_meshes(
@@ -460,7 +520,7 @@ def run():
     bound_pairs_set = set()
     matched_presets = 0
     for preset_name, pairs in STANDARD_MAP_VRM1.items():
-        if pairs:
+        if pairs or preset_name == "neutral":
             matched_presets += 1
             print(f"   🎭 [映射] {preset_name} -> {[k for _, k in pairs]}")
         for m_obj, k_name in pairs:
@@ -520,7 +580,7 @@ def run():
             ext.vrm1.expressions.custom.clear()
 
     print(
-        f"✅ [步骤 3/4] 表情绑定完成！共命中 {matched_presets} 个预设，保护 {len(bound_pairs_set)} 个核心形态键。"
+        f"✅ [步骤 3/4] 表情绑定完成！共激活 {matched_presets} 个标准预设，保护 {len(bound_pairs_set)} 个核心形态键。"
     )
 
     print(">>> [步骤 3.5/4] 开始清理未调用的冗余形态键与 NLA 动画...")
