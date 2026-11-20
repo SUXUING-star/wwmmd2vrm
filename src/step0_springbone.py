@@ -3,11 +3,42 @@ import math
 import uuid
 
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 from step1_bone_map import is_physics_or_spring_bone
 
 SNAPSHOT_PROP = "ww_mmd_spring_snapshot"
+
+BODY_COLLIDER_KEYWORDS = (
+    "head",
+    "neck",
+    "chest",
+    "upperchest",
+    "spine",
+    "hips",
+    "pelvis",
+    "shoulder",
+    "upperarm",
+    "lowerarm",
+    "hand",
+    "upperleg",
+    "lowerleg",
+    "foot",
+    "頭",
+    "头",
+    "首",
+    "上半身",
+    "下半身",
+    "腰",
+    "胸",
+    "肩",
+    "腕",
+    "ひじ",
+    "手首",
+    "足",
+    "ひざ",
+    "足首",
+)
 
 
 def _call_vrm_op(op_name, **kwargs):
@@ -53,6 +84,25 @@ def _ensure_uuid(item):
             item.uuid = uuid.uuid4().hex
         return item.uuid
     return ""
+
+
+def _is_valid_body_collider_bone(bone_name):
+    low = bone_name.lower()
+    if any(
+        bad in low
+        for bad in (
+            "裙",
+            "スカート",
+            "skirt",
+            "dummy",
+            "全ての親",
+            "センター",
+            "center",
+            "groove",
+        )
+    ):
+        return False
+    return any(kw in low for kw in BODY_COLLIDER_KEYWORDS)
 
 
 def _collect_weighted_bones(armature_obj):
@@ -131,119 +181,166 @@ def _get_mmd_rigid_dimensions(rb_obj):
     )
 
 
-def _compute_collider_local_spec(armature_obj, target_bone_name, rb_obj):
+def _compute_collider_armature_spec(armature_obj, target_bone_name, rb_obj):
+    """记录碰撞体在 Armature 空间下相对于 bone.head_local 的偏移，完全脱离 bone.matrix_local 旋转。"""
     bone = armature_obj.data.bones.get(target_bone_name)
     if not bone:
         return None
 
     shape, dims, (sx, sy, sz) = _get_mmd_rigid_dimensions(rb_obj)
-    bone_world_mat = armature_obj.matrix_world @ bone.matrix_local
-    bone_world_inv = bone_world_mat.inverted()
-    b_scale = bone_world_mat.to_scale()
-    avg_bone_scale = max(1e-5, (abs(b_scale.x) + abs(b_scale.y) + abs(b_scale.z)) / 3.0)
+    arm_inv = armature_obj.matrix_world.inverted()
+    arm_scale = armature_obj.matrix_world.to_scale()
+    avg_arm_scale = max(
+        1e-5, (abs(arm_scale.x) + abs(arm_scale.y) + abs(arm_scale.z)) / 3.0
+    )
+    head_arm = bone.head_local
 
     if shape == "SPHERE":
-        radius = max(0.005, dims[0] / avg_bone_scale)
-        offset = bone_world_inv @ rb_obj.matrix_world.translation
+        radius = dims[0] / avg_arm_scale
+        if radius <= 0.004 or radius > 0.22:
+            return None
+        d = (arm_inv @ rb_obj.matrix_world.translation) - head_arm
         return {
             "bone": target_bone_name,
             "shape": "Sphere",
-            "offset": [float(offset.x), float(offset.y), float(offset.z)],
+            "delta_arm": [float(d.x), float(d.y), float(d.z)],
             "radius": float(radius),
         }
 
     if shape == "CAPSULE":
-        radius = max(0.005, dims[0] / avg_bone_scale)
+        radius = dims[0] / avg_arm_scale
+        if radius <= 0.004 or radius > 0.22:
+            return None
         half_h_world = dims[1] * 0.5
         if half_h_world < 0.003:
-            offset = bone_world_inv @ rb_obj.matrix_world.translation
+            d = (arm_inv @ rb_obj.matrix_world.translation) - head_arm
             return {
                 "bone": target_bone_name,
                 "shape": "Sphere",
-                "offset": [float(offset.x), float(offset.y), float(offset.z)],
+                "delta_arm": [float(d.x), float(d.y), float(d.z)],
                 "radius": float(radius),
             }
         local_z = half_h_world / max(1e-5, sz)
-        p_a = bone_world_inv @ (rb_obj.matrix_world @ Vector((0.0, 0.0, -local_z)))
-        p_b = bone_world_inv @ (rb_obj.matrix_world @ Vector((0.0, 0.0, local_z)))
+        d_a = (
+            arm_inv @ (rb_obj.matrix_world @ Vector((0.0, 0.0, -local_z)))
+        ) - head_arm
+        d_b = (arm_inv @ (rb_obj.matrix_world @ Vector((0.0, 0.0, local_z)))) - head_arm
         return {
             "bone": target_bone_name,
             "shape": "Capsule",
-            "offset": [float(p_a.x), float(p_a.y), float(p_a.z)],
-            "tail": [float(p_b.x), float(p_b.y), float(p_b.z)],
+            "delta_arm": [float(d_a.x), float(d_a.y), float(d_a.z)],
+            "tail_delta_arm": [float(d_b.x), float(d_b.y), float(d_b.z)],
             "radius": float(radius),
         }
 
-    # BOX -> 近似为胶囊体或球体
     hx, hy, hz = dims
     axes = [(hx, 0, sx), (hy, 1, sy), (hz, 2, sz)]
     axes.sort(key=lambda x: x[0], reverse=True)
     longest, idx_max, s_max = axes[0]
     mid, smallest = axes[1][0], axes[2][0]
 
-    if longest > mid * 1.35 and longest > 0.01:
-        r_world = max(0.005, (mid + smallest) * 0.5)
+    r_world = min(mid, smallest) if longest > mid * 1.4 else (hx + hy + hz) / 3.0
+    radius = r_world / avg_arm_scale
+    if radius <= 0.005 or radius > 0.18:
+        return None
+
+    if longest > mid * 1.4 and longest > 0.015:
         half_len_world = max(0.0, longest - r_world)
         local_vec = [0.0, 0.0, 0.0]
         local_vec[idx_max] = half_len_world / max(1e-5, s_max)
         v_pos = Vector(local_vec)
-        p_a = bone_world_inv @ (rb_obj.matrix_world @ (-v_pos))
-        p_b = bone_world_inv @ (rb_obj.matrix_world @ v_pos)
+        d_a = (arm_inv @ (rb_obj.matrix_world @ (-v_pos))) - head_arm
+        d_b = (arm_inv @ (rb_obj.matrix_world @ v_pos)) - head_arm
         return {
             "bone": target_bone_name,
             "shape": "Capsule",
-            "offset": [float(p_a.x), float(p_a.y), float(p_a.z)],
-            "tail": [float(p_b.x), float(p_b.y), float(p_b.z)],
-            "radius": float(r_world / avg_bone_scale),
+            "delta_arm": [float(d_a.x), float(d_a.y), float(d_a.z)],
+            "tail_delta_arm": [float(d_b.x), float(d_b.y), float(d_b.z)],
+            "radius": float(radius),
         }
 
-    r_world = max(0.005, (hx + hy + hz) / 3.0)
-    offset = bone_world_inv @ rb_obj.matrix_world.translation
+    d = (arm_inv @ rb_obj.matrix_world.translation) - head_arm
     return {
         "bone": target_bone_name,
         "shape": "Sphere",
-        "offset": [float(offset.x), float(offset.y), float(offset.z)],
-        "radius": float(r_world / avg_bone_scale),
+        "delta_arm": [float(d.x), float(d.y), float(d.z)],
+        "radius": float(radius),
     }
 
 
-def _compute_joint_params(bone_name, rb_obj, joint_obj):
-    low = bone_name.lower()
-    hit_radius = 0.025
-    stiffness = 0.85
-    drag_force = 0.45
-    gravity_power = 0.35
+def _classify_spring_part(name: str) -> str:
+    low = name.lower()
+    if any(k in low for k in ("胸", "bust", "boob", "oppai")):
+        return "bust"
+    if any(
+        k in low for k in ("前髪", "bangs", "ahoge", "アホ毛", "sideburn", "もみあげ")
+    ):
+        return "bangs"
+    if any(
+        k in low
+        for k in (
+            "髪",
+            "发",
+            "hair",
+            "twin",
+            "pony",
+            "braid",
+            "ツイン",
+            "ポニ",
+            "辮",
+            "辫",
+        )
+    ):
+        return "hair"
+    if any(
+        k in low
+        for k in ("スカート", "skirt", "マント", "cape", "裾", "裙", "cloth", "dress")
+    ):
+        return "skirt"
+    return "other"
 
+
+def _compute_joint_params(bone_name, rb_obj, joint_obj):
+    part = _classify_spring_part(bone_name)
+    hit_radius = 0.015
     if rb_obj is not None:
         shape, dims, _ = _get_mmd_rigid_dimensions(rb_obj)
-        hit_radius = (
+        raw_r = (
             dims[0]
             if shape in ("SPHERE", "CAPSULE")
             else min(dims[0], dims[1], dims[2])
         )
-        hit_radius = max(0.008, min(0.12, float(hit_radius)))
-        ang_damp = float(getattr(rb_obj.mmd_rigid, "angular_damping", 0.5))
-        drag_force = max(0.25, min(0.75, 0.30 + ang_damp * 0.40))
+        hit_radius = max(0.008, min(0.030, float(raw_r) * 0.5))
 
+    mmd_sp = 0.0
     if joint_obj is not None:
         mmd_j = getattr(joint_obj, "mmd_joint", None)
         if mmd_j and hasattr(mmd_j, "spring_angular"):
-            avg_sp = sum(abs(float(x)) for x in mmd_j.spring_angular) / 3.0
-            if avg_sp > 0.0:
-                stiffness = min(3.2, max(0.35, 0.45 + 0.65 * math.log10(1.0 + avg_sp)))
+            mmd_sp = sum(abs(float(x)) for x in mmd_j.spring_angular) / 3.0
 
-    if any(k in low for k in ("胸", "bust", "boob", "oppai")):
-        stiffness = max(stiffness, 1.8)
-        drag_force = max(drag_force, 0.55)
+    sp_norm = min(1.0, math.log10(1.0 + mmd_sp) / 2.5) if mmd_sp > 0.0 else 0.35
+
+    # 校准为 VRM 1.0 (three-vrm) 真实摆动区间
+    if part == "bust":
+        stiffness = 1.60 + 0.40 * sp_norm
+        drag_force = 0.55
+        gravity_power = 0.08
+    elif part == "bangs":
+        stiffness = 0.65 + 0.35 * sp_norm
+        drag_force = 0.40
         gravity_power = 0.15
-    elif any(
-        k in low for k in ("前髪", "bangs", "ahoge", "アホ毛", "sideburn", "もみあげ")
-    ):
-        stiffness = max(stiffness, 1.05)
+    elif part == "hair":
+        stiffness = 0.45 + 0.35 * sp_norm
+        drag_force = 0.36
+        gravity_power = 0.20
+    elif part == "skirt":
+        stiffness = 0.70 + 0.35 * sp_norm
+        drag_force = 0.45
         gravity_power = 0.25
-    elif any(k in low for k in ("スカート", "skirt", "マント", "cape", "裾", "裙")):
-        stiffness = min(max(stiffness, 0.55), 1.35)
-        gravity_power = 0.45
+    else:
+        stiffness = 0.45 + 0.35 * sp_norm
+        drag_force = 0.38
+        gravity_power = 0.22
 
     return float(hit_radius), float(stiffness), float(drag_force), float(gravity_power)
 
@@ -279,10 +376,6 @@ def _collect_linear_chains(roots, physics_bones):
 
 
 def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
-    """
-    在清理 MMD 刚体/关节之前，将物理链与碰撞体参数拍成轻量化 JSON 快照保存在骨骼上。
-    这样 step1_skeleton 改名/合并骨骼时不会频繁触发 VRM 插件回调导致卡顿。
-    """
     armature_obj = armature_obj or next(
         (o for o in bpy.data.objects if o.type == "ARMATURE"), None
     )
@@ -357,14 +450,14 @@ def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
 
         cols_by_group = {"0": []}
         for cands, rad, off in (
-            (("Head", "頭", "头"), 0.095, [0.0, 0.08, 0.0]),
-            (("UpperChest", "Chest", "上半身2", "上半身"), 0.11, [0.0, 0.06, 0.0]),
-            (("Hips", "下半身", "腰", "Pelvis"), 0.11, [0.0, 0.0, 0.0]),
+            (("Head", "頭", "头"), 0.085, [0.0, 0.0, 0.08]),
+            (("UpperChest", "Chest", "上半身2", "上半身"), 0.095, [0.0, 0.0, 0.05]),
+            (("Hips", "下半身", "腰", "Pelvis"), 0.09, [0.0, 0.0, 0.0]),
         ):
             b = next((bones[c] for c in cands if c in bones), None)
             if b:
                 cols_by_group["0"].append(
-                    {"bone": b.name, "shape": "Sphere", "offset": off, "radius": rad}
+                    {"bone": b.name, "shape": "Sphere", "delta_arm": off, "radius": rad}
                 )
 
         roots = [
@@ -374,21 +467,20 @@ def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
             and (b.parent is None or b.parent.name not in physics_bones)
         ]
         chains = _collect_linear_chains(roots, physics_bones)
-        springs = []
-        for idx, ch in enumerate(chains):
-            springs.append(
-                {
-                    "name": f"Spring_{ch[0].name}_{idx}",
-                    "groups": ["0"] if cols_by_group["0"] else [],
-                    "joints": [
-                        {
-                            "bone": b.name,
-                            "params": list(_compute_joint_params(b.name, None, None)),
-                        }
-                        for b in ch
-                    ],
-                }
-            )
+        springs = [
+            {
+                "name": f"Spring_{ch[0].name}_{idx}",
+                "groups": ["0"] if cols_by_group["0"] else [],
+                "joints": [
+                    {
+                        "bone": b.name,
+                        "params": list(_compute_joint_params(b.name, None, None)),
+                    }
+                    for b in ch
+                ],
+            }
+            for idx, ch in enumerate(chains)
+        ]
         snap = {
             "mode": "heuristic",
             "center_bone": center_bone_name,
@@ -396,10 +488,6 @@ def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
             "springs": springs,
         }
         armature_obj[SNAPSHOT_PROP] = json.dumps(snap, ensure_ascii=False)
-        print(
-            f"   🌸 [SpringBone 快照(启发式)] 已缓存 {len(springs)} 条弹簧链、"
-            f"{len(cols_by_group['0'])} 个碰撞体，将在骨骼规整后写入 VRM。"
-        )
         return True
 
     weighted_bones = _collect_weighted_bones(armature_obj)
@@ -412,6 +500,7 @@ def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
     cols_by_group = {}
     bone_to_rigid = {}
     col_count = 0
+    skipped_non_body = 0
 
     for rb_obj in rigid_bodies:
         mmd_rb = getattr(rb_obj, "mmd_rigid", None)
@@ -423,7 +512,10 @@ def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
         rb_type = str(getattr(mmd_rb, "type", "0"))
         if rb_type == "0":
             target_bone = _remap_mmd_collider_bone(raw_bone_name, bones, weighted_bones)
-            spec = _compute_collider_local_spec(armature_obj, target_bone, rb_obj)
+            if not _is_valid_body_collider_bone(target_bone):
+                skipped_non_body += 1
+                continue
+            spec = _compute_collider_armature_spec(armature_obj, target_bone, rb_obj)
             if spec is not None:
                 grp_key = str(int(getattr(mmd_rb, "collision_group_number", 0)))
                 cols_by_group.setdefault(grp_key, []).append(spec)
@@ -501,9 +593,8 @@ def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
     }
     armature_obj[SNAPSHOT_PROP] = json.dumps(snap, ensure_ascii=False)
     print(
-        f"   🌸 [SpringBone 快照] 已从 MMD 刚体/关节缓存：{len(springs)} 条弹簧链"
-        f"（{total_joints} 个关节），{col_count} 个碰撞体（{len(cols_by_group)} 组），"
-        f"将在骨骼规整后写入 VRM。"
+        f"   🌸 [SpringBone 快照] 缓存 {len(springs)} 条弹簧链（{total_joints} 个关节），"
+        f"{col_count} 个身体碰撞体（过滤 {skipped_non_body} 个非人体刚体）。"
     )
     return True
 
@@ -528,6 +619,16 @@ def get_snapshot_spring_bone_names(armature_obj):
             if j.get("bone"):
                 names.add(j["bone"])
     return names
+
+
+def _point_segment_distance(p, a, b):
+    ab = b - a
+    len_sq = ab.length_squared
+    if len_sq < 1e-10:
+        return (p - a).length
+    t = max(0.0, min(1.0, (p - a).dot(ab) / len_sq))
+    proj = a + ab * t
+    return (p - proj).length
 
 
 def _create_vrm1_collider_entry(armature_obj, bone_name):
@@ -561,8 +662,52 @@ def _create_vrm1_collider_entry(armature_obj, bone_name):
     return col
 
 
+def _probe_bone_collider_basis(col, armature_obj, bone_name, is_capsule, cache):
+    """实测该骨骼下 col.shape.*.offset 到 Blender 世界坐标的基矩阵，保证 0 位置偏差。"""
+    key = (bone_name, "Capsule" if is_capsule else "Sphere")
+    if key in cache:
+        return cache[key]
+
+    if not hasattr(col, "bpy_object") or col.bpy_object is None:
+        bone = armature_obj.data.bones.get(bone_name)
+        bw = armature_obj.matrix_world @ bone.matrix_local
+        res = (bw.translation.copy(), bw.to_3x3().inverted())
+        cache[key] = res
+        return res
+
+    vl = bpy.context.view_layer
+    if is_capsule:
+        _set_enum_ci(col, "shape_type", "Capsule")
+        col.shape.capsule.offset = (0.0, 0.0, 0.0)
+        col.shape.capsule.tail = (0.0, 0.0, 0.05)
+    else:
+        _set_enum_ci(col, "shape_type", "Sphere")
+        col.shape.sphere.offset = (0.0, 0.0, 0.0)
+    vl.update()
+    o0 = col.bpy_object.matrix_world.translation.copy()
+
+    cols_mat = []
+    for axis in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+        if is_capsule:
+            col.shape.capsule.offset = axis
+        else:
+            col.shape.sphere.offset = axis
+        vl.update()
+        cols_mat.append(col.bpy_object.matrix_world.translation - o0)
+
+    basis = Matrix((cols_mat[0], cols_mat[1], cols_mat[2])).transposed()
+    if abs(basis.determinant()) < 1e-8:
+        bone = armature_obj.data.bones.get(bone_name)
+        basis_inv = (armature_obj.matrix_world @ bone.matrix_local).to_3x3().inverted()
+    else:
+        basis_inv = basis.inverted()
+
+    cache[key] = (o0, basis_inv)
+    return o0, basis_inv
+
+
 def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=True):
-    """将步骤 0 缓存的物理快照（按最终骨骼名重映射后）一次性写入 VRM spring_bone1。"""
+    """按最终骨骼名重映射，按 (mmd组, 骨骼) 细粒度建碰撞组并对每条弹簧链单独屏蔽静息穿插碰撞。"""
     if not armature_obj or SNAPSHOT_PROP not in armature_obj:
         return 0, 0
     ext = getattr(armature_obj.data, "vrm_addon_extension", None)
@@ -593,9 +738,18 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
     def resolve_bone(bname):
         return rename_map.get(bname, bname)
 
-    # 1. 创建全部碰撞体（仅保存 uuid, name）
-    group_to_col_refs = {}
+    arm_mat = armature_obj.matrix_world
+    arm_scale = arm_mat.to_scale()
+    avg_arm_scale = max(
+        1e-5, (abs(arm_scale.x) + abs(arm_scale.y) + abs(arm_scale.z)) / 3.0
+    )
+
+    # 1. 创建碰撞体并按 (grp_key, bone_name) 细粒度保存世界坐标几何信息
+    basis_cache = {}
+    col_records_by_subkey = {}
+    grp_to_subkeys = {}
     col_count = 0
+
     for grp_key, col_specs in sorted(
         snap.get("collider_groups", {}).items(), key=lambda x: int(x[0])
     ):
@@ -603,51 +757,95 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
             bname = resolve_bone(spec["bone"])
             if bname not in bones:
                 continue
+            b_obj = bones[bname]
+            p_a_world = arm_mat @ (b_obj.head_local + Vector(spec["delta_arm"]))
+            is_cap = spec["shape"] == "Capsule"
+            p_b_world = (
+                arm_mat @ (b_obj.head_local + Vector(spec["tail_delta_arm"]))
+                if is_cap
+                else p_a_world
+            )
+            col_r_world = float(spec["radius"]) * avg_arm_scale
+
             col = _create_vrm1_collider_entry(armature_obj, bname)
-            if spec["shape"] == "Capsule":
+            o0, basis_inv = _probe_bone_collider_basis(
+                col, armature_obj, bname, is_cap, basis_cache
+            )
+            off_a = basis_inv @ (p_a_world - o0)
+            final_r = max(0.008, float(spec["radius"]))
+
+            if is_cap:
+                off_b = basis_inv @ (p_b_world - o0)
                 _set_enum_ci(col, "shape_type", "Capsule")
-                col.shape.capsule.offset = tuple(spec["offset"])
-                col.shape.capsule.tail = tuple(spec["tail"])
-                col.shape.capsule.radius = float(spec["radius"])
+                col.shape.capsule.offset = (
+                    float(off_a.x),
+                    float(off_a.y),
+                    float(off_a.z),
+                )
+                col.shape.capsule.tail = (
+                    float(off_b.x),
+                    float(off_b.y),
+                    float(off_b.z),
+                )
+                col.shape.capsule.radius = final_r
             else:
                 _set_enum_ci(col, "shape_type", "Sphere")
-                col.shape.sphere.offset = tuple(spec["offset"])
-                col.shape.sphere.radius = float(spec["radius"])
-            group_to_col_refs.setdefault(grp_key, []).append(
-                (_ensure_uuid(col), getattr(col, "name", ""))
+                col.shape.sphere.offset = (
+                    float(off_a.x),
+                    float(off_a.y),
+                    float(off_a.z),
+                )
+                col.shape.sphere.radius = final_r
+
+            subkey = (grp_key, bname)
+            col_records_by_subkey.setdefault(subkey, []).append(
+                {
+                    "uuid": _ensure_uuid(col),
+                    "name": getattr(col, "name", ""),
+                    "is_cap": is_cap,
+                    "p_a": p_a_world,
+                    "p_b": p_b_world,
+                    "r_world": col_r_world,
+                }
             )
+            grp_to_subkeys.setdefault(grp_key, set()).add(subkey)
             col_count += 1
 
-    # 2. 通过 .add() 创建 ColliderGroups
+    # 2. 按 (grp_key, bone_name) 建立细粒度 ColliderGroup
     sb1 = _get_sb1(armature_obj)
-    group_to_cg_ref = {}
-    for grp_key, col_refs in sorted(group_to_col_refs.items(), key=lambda x: int(x[0])):
+    subkey_to_cg_ref = {}
+    for subkey, recs in sorted(
+        col_records_by_subkey.items(), key=lambda x: (int(x[0][0]), x[0][1])
+    ):
         cg = sb1.collider_groups.add()
         cg_uuid = _ensure_uuid(cg)
-        cg_name = f"MMD_Group_{grp_key}"
+        cg_name = f"MMD_G{subkey[0]}_{subkey[1]}"
         if hasattr(cg, "vrm_name"):
             cg.vrm_name = cg_name
         elif hasattr(cg, "name"):
             cg.name = cg_name
-        for col_uuid, col_name in col_refs:
+        for rec in recs:
             ref = cg.colliders.add()
             if hasattr(ref, "collider_uuid"):
-                ref.collider_uuid = col_uuid
+                ref.collider_uuid = rec["uuid"]
             elif hasattr(ref, "collider_name"):
-                ref.collider_name = col_name
-        group_to_cg_ref[grp_key] = (
+                ref.collider_name = rec["name"]
+        subkey_to_cg_ref[subkey] = (
             cg_uuid,
             getattr(cg, "vrm_name", getattr(cg, "name", cg_name)),
         )
 
-    # 3. 通过 .add() 创建 Springs
+    # 3. 建立 Springs，并逐链检查与各个 (grp_key, bone_name) 碰撞组是否在静息态重叠
     raw_center = snap.get("center_bone", "")
     center_bone = resolve_bone(raw_center) if raw_center else ""
     if center_bone not in bones:
         center_bone = "Root" if "Root" in bones else ""
 
+    cat_counts = {"hair": 0, "bangs": 0, "skirt": 0, "bust": 0, "other": 0}
     created_springs = 0
     total_joints = 0
+    masked_overlap_links = 0
+
     for idx, sp_spec in enumerate(snap.get("springs", [])):
         valid_joints = []
         seen_b = set()
@@ -659,12 +857,27 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
         if len(valid_joints) < 2:
             continue
 
+        # 该链在静息姿态下实际受碰撞的节点位置（j1..jn + 末梢 tail）
+        moving_pts = []
+        for idx_j in range(1, len(valid_joints)):
+            jb = bones[valid_joints[idx_j][0]]
+            j_hit_r = valid_joints[idx_j - 1][1][0] * avg_arm_scale
+            moving_pts.append((arm_mat @ jb.head_local, j_hit_r))
+        last_b = bones[valid_joints[-1][0]]
+        if (last_b.tail_local - last_b.head_local).length > 1e-4:
+            moving_pts.append(
+                (arm_mat @ last_b.tail_local, valid_joints[-1][1][0] * avg_arm_scale)
+            )
+
         sp = sb1.springs.add()
         sp_name = f"Spring_{valid_joints[0][0]}_{idx}"
         if hasattr(sp, "vrm_name"):
             sp.vrm_name = sp_name
         elif hasattr(sp, "name"):
             sp.name = sp_name
+
+        cat = _classify_spring_part(valid_joints[0][0])
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
         if center_bone and center_bone not in seen_b:
             if hasattr(sp, "center") and hasattr(sp.center, "bone_name"):
@@ -684,18 +897,39 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
                 j.drag_force = drag_force
             if hasattr(j, "gravity_power"):
                 j.gravity_power = gravity_power
+            if hasattr(j, "gravity_dir"):
+                j.gravity_dir = (0.0, 0.0, -1.0)
             total_joints += 1
 
         sp.collider_groups.clear()
         for grp_key in sp_spec.get("groups", []):
-            cg_ref = group_to_cg_ref.get(grp_key)
-            if not cg_ref:
-                continue
-            ref = sp.collider_groups.add()
-            if hasattr(ref, "collider_group_uuid"):
-                ref.collider_group_uuid = cg_ref[0]
-            elif hasattr(ref, "collider_group_name"):
-                ref.collider_group_name = cg_ref[1]
+            for subkey in sorted(grp_to_subkeys.get(grp_key, set())):
+                recs = col_records_by_subkey.get(subkey, [])
+                # 检测该细粒度碰撞组是否在静息态就穿插了当前链，若有穿插则仅对该链屏蔽（模拟 MMD nonCollisionJointTable）
+                overlaps = False
+                for rec in recs:
+                    for pt_w, j_hit_r in moving_pts:
+                        d_w = (
+                            _point_segment_distance(pt_w, rec["p_a"], rec["p_b"])
+                            if rec["is_cap"]
+                            else (pt_w - rec["p_a"]).length
+                        )
+                        if d_w < rec["r_world"] + j_hit_r + 0.003:
+                            overlaps = True
+                            break
+                    if overlaps:
+                        break
+                if overlaps:
+                    masked_overlap_links += 1
+                    continue
+
+                cg_ref = subkey_to_cg_ref.get(subkey)
+                if cg_ref:
+                    ref = sp.collider_groups.add()
+                    if hasattr(ref, "collider_group_uuid"):
+                        ref.collider_group_uuid = cg_ref[0]
+                    elif hasattr(ref, "collider_group_name"):
+                        ref.collider_group_name = cg_ref[1]
         created_springs += 1
 
     try:
@@ -704,14 +938,14 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
         pass
 
     print(
-        f"   🌸 [SpringBone 写入] 已写入 VRM：springs={created_springs} 条（joints={total_joints} 个），"
-        f"colliders={col_count} 个，colliderGroups={len(group_to_cg_ref)} 组。"
+        f"   🌸 [SpringBone 写入] springs={created_springs} 条（joints={total_joints} 个, 分布={cat_counts}），"
+        f"colliders={col_count} 个，colliderGroups={len(subkey_to_cg_ref)} 组，"
+        f"静息穿插免碰屏蔽={masked_overlap_links} 对。"
     )
     return created_springs, col_count
 
 
 def extract_mmd_spring_bones_to_vrm(armature_obj=None, overwrite=False):
-    """兼容直接调用：拍取 MMD 物理快照并立即写入 VRM spring_bone1。"""
     armature_obj = armature_obj or next(
         (o for o in bpy.data.objects if o.type == "ARMATURE"), None
     )

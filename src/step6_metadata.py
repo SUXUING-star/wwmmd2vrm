@@ -382,12 +382,17 @@ def inspect_exported_vrm(vrm_path):
     print(
         f"   😊 [VRM 导出表情验证] 全部已注册预设({len(bound_summary)}个): {bound_summary}"
     )
+    anim_cnt = len(gltf.get("animations", []))
     sb_ext = gltf.get("extensions", {}).get("VRMC_springBone", {})
     sb_springs = sb_ext.get("springs", [])
     sb_joints = sum(len(s.get("joints", [])) for s in sb_springs)
+    sample_j = next((s["joints"][0] for s in sb_springs if s.get("joints")), {})
     print(
-        f"   🌸 [VRM 导出弹簧骨验证] springs={len(sb_springs)}, joints={sb_joints}, "
-        f"colliders={len(sb_ext.get('colliders', []))}, colliderGroups={len(sb_ext.get('colliderGroups', []))}"
+        f"   🔍 [VRM 导出动作与弹簧骨验证] animations={anim_cnt} | "
+        f"springs={len(sb_springs)}, joints={sb_joints}, "
+        f"colliders={len(sb_ext.get('colliders', []))}, colliderGroups={len(sb_ext.get('colliderGroups', []))} | "
+        f"示例={{stiffness={sample_j.get('stiffness')}, dragForce={sample_j.get('dragForce')}, "
+        f"gravityPower={sample_j.get('gravityPower')}, gravityDir={sample_j.get('gravityDir')}, hitRadius={sample_j.get('hitRadius')}}}"
     )
 
 
