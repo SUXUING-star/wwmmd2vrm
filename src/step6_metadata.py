@@ -382,6 +382,13 @@ def inspect_exported_vrm(vrm_path):
     print(
         f"   😊 [VRM 导出表情验证] 全部已注册预设({len(bound_summary)}个): {bound_summary}"
     )
+    sb_ext = gltf.get("extensions", {}).get("VRMC_springBone", {})
+    sb_springs = sb_ext.get("springs", [])
+    sb_joints = sum(len(s.get("joints", [])) for s in sb_springs)
+    print(
+        f"   🌸 [VRM 导出弹簧骨验证] springs={len(sb_springs)}, joints={sb_joints}, "
+        f"colliders={len(sb_ext.get('colliders', []))}, colliderGroups={len(sb_ext.get('colliderGroups', []))}"
+    )
 
 
 def run(config):

@@ -6,6 +6,7 @@ import bpy
 from mathutils import Vector, kdtree
 
 from step0_mat_map import classify_surface_for_normals, extract_material_base_image
+from step0_springbone import snapshot_mmd_physics_to_armature
 
 
 def snapshot_custom_normals(mesh):
@@ -360,6 +361,9 @@ def is_mmd_physics_or_garbage(obj):
 
 def run():
     print(">>> [步骤 0] 无损法线保护 + 皮肤代理法线重构 + 清理 mmd_tools 刚体/关节...")
+
+    # 在删除 MMD 刚体/关节前仅拍取轻量化物理快照，避免步骤 1 改名时触发 VRM 回调卡顿
+    snapshot_mmd_physics_to_armature()
 
     removed_cnt = 0
     for obj in list(bpy.data.objects):

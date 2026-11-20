@@ -1,9 +1,16 @@
 import math
 import re
+import time
 
 import bpy
+import numpy as np
 from mathutils import Vector
 
+from step0_springbone import (
+    apply_mmd_spring_snapshot_to_vrm,
+    get_snapshot_spring_bone_names,
+    snapshot_mmd_physics_to_armature,
+)
 from step1_bone_map import (
     BASE_BONE_RENAME_MAP,
     FLATTEN_CONTROL_BONES,
@@ -25,6 +32,21 @@ def is_ancestor(bone, maybe_ancestor):
             return True
         cur = cur.parent
     return False
+
+
+def get_bound_meshes(armature_obj):
+    return [
+        o
+        for o in bpy.data.objects
+        if o.type == "MESH"
+        and o.data
+        and (
+            o.parent == armature_obj
+            or any(
+                m.type == "ARMATURE" and m.object == armature_obj for m in o.modifiers
+            )
+        )
+    ]
 
 
 def iter_spring_bone_refs(ext):
@@ -57,11 +79,13 @@ def iter_spring_bone_refs(ext):
 
 def collect_existing_spring_bone_names(armature_obj):
     ext = getattr(armature_obj.data, "vrm_addon_extension", None)
-    return {
+    names = {
         ref.bone_name
         for ref in iter_spring_bone_refs(ext)
         if getattr(ref, "bone_name", "")
     }
+    names.update(get_snapshot_spring_bone_names(armature_obj))
+    return names
 
 
 def sync_spring_bone_rename(armature_obj, old_name, new_name):
@@ -71,15 +95,12 @@ def sync_spring_bone_rename(armature_obj, old_name, new_name):
             ref.bone_name = new_name
 
 
-def collect_weighted_bone_names(armature_obj):
+def collect_weighted_bone_names(armature_obj, bound_meshes=None):
     weighted = {}
-    for obj in bpy.data.objects:
-        if obj.type != "MESH" or not obj.data or not obj.vertex_groups:
-            continue
-        bound = obj.parent == armature_obj or any(
-            m.type == "ARMATURE" and m.object == armature_obj for m in obj.modifiers
-        )
-        if not bound:
+    if bound_meshes is None:
+        bound_meshes = get_bound_meshes(armature_obj)
+    for obj in bound_meshes:
+        if not obj.vertex_groups:
             continue
         idx_to_name = {vg.index: vg.name for vg in obj.vertex_groups}
         for v in obj.data.vertices:
@@ -129,27 +150,26 @@ def resolve_torso_chain(edit_bones, hips_b, neck_or_head_b, arm_l_b, arm_r_b):
     return res
 
 
-def safe_rename_bone(armature_obj, bone, new_name, existing_names):
+def safe_rename_bone(
+    armature_obj, bone, new_name, existing_names, bound_meshes=None, has_vrm_refs=True
+):
     old_name = bone.name
     if old_name == new_name or new_name in existing_names:
-        return False
+        return None
     bone.name = new_name
+    final_name = bone.name
     existing_names.discard(old_name)
-    existing_names.add(bone.name)
-    for obj in bpy.data.objects:
-        if obj.type != "MESH" or not obj.vertex_groups:
+    existing_names.add(final_name)
+    if bound_meshes is None:
+        bound_meshes = get_bound_meshes(armature_obj)
+    for obj in bound_meshes:
+        if not obj.vertex_groups:
             continue
-        bound = obj.parent == armature_obj or any(
-            m.type == "ARMATURE" and m.object == armature_obj for m in obj.modifiers
-        )
-        if (
-            bound
-            and old_name in obj.vertex_groups
-            and bone.name not in obj.vertex_groups
-        ):
-            obj.vertex_groups[old_name].name = bone.name
-    sync_spring_bone_rename(armature_obj, old_name, bone.name)
-    return True
+        if old_name in obj.vertex_groups and final_name not in obj.vertex_groups:
+            obj.vertex_groups[old_name].name = final_name
+    if has_vrm_refs:
+        sync_spring_bone_rename(armature_obj, old_name, final_name)
+    return final_name
 
 
 def validate_and_assign_vrm_humanoid(armature_obj, skip_toes=False):
@@ -254,21 +274,11 @@ def bone_depth(b):
     return d
 
 
-def merge_bone_pairs_to_parent(armature_obj, child_to_parent):
+def merge_bone_pairs_to_parent(armature_obj, child_to_parent, bound_meshes=None):
     if not child_to_parent:
         return 0
-    bound_meshes = [
-        o
-        for o in bpy.data.objects
-        if o.type == "MESH"
-        and o.data
-        and (
-            o.parent == armature_obj
-            or any(
-                m.type == "ARMATURE" and m.object == armature_obj for m in o.modifiers
-            )
-        )
-    ]
+    if bound_meshes is None:
+        bound_meshes = get_bound_meshes(armature_obj)
     for mesh_obj in bound_meshes:
         vgs = mesh_obj.vertex_groups
         if not vgs:
@@ -293,88 +303,128 @@ def merge_bone_pairs_to_parent(armature_obj, child_to_parent):
     bpy.ops.object.mode_set(mode="EDIT")
     eb = armature_obj.data.edit_bones
     removed = 0
-    for bname in child_to_parent:
+    for bname, dst_name in child_to_parent.items():
         if bname in eb:
-            p = eb[bname].parent
+            target_parent = eb.get(dst_name) or eb[bname].parent
             for ch in list(eb[bname].children):
-                ch.parent = p
+                ch.parent = target_parent
             eb.remove(eb[bname])
             removed += 1
     bpy.ops.object.mode_set(mode="OBJECT")
     return removed
 
 
-def merge_excess_bones_to_limit(armature_obj, protected_names, max_bones=240):
+def merge_excess_bones_to_limit(
+    armature_obj, protected_names, max_bones=240, bound_meshes=None
+):
     if max_bones <= 0 or len(armature_obj.data.bones) <= max_bones:
-        return 0
+        return 0, {}
 
-    merged_total = 0
-    while len(armature_obj.data.bones) > max_bones:
-        excess = len(armature_obj.data.bones) - max_bones
+    # 在内存中一次性推演全部可合并链条，最后只切换 1 次 Edit 模式和扫描 1 次顶点
+    parent_of = {
+        b.name: (b.parent.name if b.parent else None) for b in armature_obj.data.bones
+    }
+    child_cnt = {b.name: len(b.children) for b in armature_obj.data.bones}
+    depth_of = {b.name: bone_depth(b) for b in armature_obj.data.bones}
+
+    total_count = len(parent_of)
+    direct_merge = {}
+
+    while total_count > max_bones:
+        excess = total_count - max_bones
         leaves = [
-            b
-            for b in armature_obj.data.bones
-            if len(b.children) == 0
-            and b.parent is not None
-            and b.name not in protected_names
+            bname
+            for bname, cnt in child_cnt.items()
+            if cnt == 0
+            and parent_of.get(bname) is not None
+            and bname not in protected_names
         ]
         if not leaves:
             break
 
-        # 分级优先级：
-        # 0 = 非摇晃的扭转/辅助/道具骨 (twist, bip001_, aux, cancel, prop) -> 优先合并
-        # 1 = 其它普通辅助末梢骨
-        # 2 = 头发/裙摆/胸部/丝带等弹簧摇晃链 -> 尽量保留根中段，只从最深链条末端缩减
-        def leaf_priority(b):
-            low = b.name.lower()
+        def leaf_priority(bname):
+            low = bname.lower()
             if any(k in low for k in ("twist", "bip001_", "aux", "cancel", "prop")):
                 tier = 0
-            elif is_physics_or_spring_bone(b.name):
+            elif is_physics_or_spring_bone(bname):
                 tier = 2
             else:
                 tier = 1
-            return (tier, -bone_depth(b))
+            return (tier, -depth_of[bname])
 
         leaves.sort(key=leaf_priority)
         batch = leaves[:excess]
-        child_to_parent = {b.name: b.parent.name for b in batch}
-        merged_total += merge_bone_pairs_to_parent(armature_obj, child_to_parent)
+        for bname in batch:
+            p = parent_of[bname]
+            direct_merge[bname] = p
+            child_cnt.pop(bname, None)
+            if p in child_cnt:
+                child_cnt[p] = max(0, child_cnt[p] - 1)
+            total_count -= 1
 
-    return merged_total
+    if not direct_merge:
+        return 0, {}
+
+    child_to_surviving = {}
+    for bname in direct_merge:
+        cur = direct_merge[bname]
+        while cur in direct_merge:
+            cur = direct_merge[cur]
+        child_to_surviving[bname] = cur
+
+    merged_total = merge_bone_pairs_to_parent(
+        armature_obj, child_to_surviving, bound_meshes=bound_meshes
+    )
+    return merged_total, child_to_surviving
 
 
-def ground_model_to_z0(armature_obj):
-    bound_meshes = [
-        o
-        for o in bpy.data.objects
-        if o.type == "MESH"
-        and o.data
-        and (
-            o.parent == armature_obj
-            or any(
-                m.type == "ARMATURE" and m.object == armature_obj for m in o.modifiers
-            )
-        )
-    ]
+def ground_model_to_z0(armature_obj, bound_meshes=None):
+    if bound_meshes is None:
+        bound_meshes = get_bound_meshes(armature_obj)
     if not bound_meshes:
         return 0.0
 
-    min_z = min(
-        (o.matrix_world @ v.co).z for o in bound_meshes for v in o.data.vertices
-    )
+    min_z = float("inf")
+    for o in bound_meshes:
+        n = len(o.data.vertices)
+        if n == 0:
+            continue
+        co = np.empty(n * 3, dtype=np.float32)
+        o.data.vertices.foreach_get("co", co)
+        pts = co.reshape(-1, 3)
+        mat = np.array(o.matrix_world, dtype=np.float32)
+        z_vals = pts @ mat[2, :3] + mat[2, 3]
+        m = float(np.min(z_vals))
+        if m < min_z:
+            min_z = m
+
+    if min_z == float("inf"):
+        return 0.0
     dz = -min_z
     if abs(dz) < 0.001:
         return 0.0
 
     world_shift = Vector((0.0, 0.0, dz))
     for o in bound_meshes:
+        n = len(o.data.vertices)
+        if n == 0:
+            continue
         local_shift = o.matrix_world.inverted().to_3x3() @ world_shift
-        for v in o.data.vertices:
-            v.co += local_shift
+        shift_arr = np.array(
+            [local_shift.x, local_shift.y, local_shift.z], dtype=np.float32
+        )
+
+        co = np.empty(n * 3, dtype=np.float32)
+        o.data.vertices.foreach_get("co", co)
+        co.reshape(-1, 3)[:] += shift_arr
+        o.data.vertices.foreach_set("co", co)
+
         if o.data.shape_keys:
             for kb in o.data.shape_keys.key_blocks:
-                for kv in kb.data:
-                    kv.co += local_shift
+                k_co = np.empty(n * 3, dtype=np.float32)
+                kb.data.foreach_get("co", k_co)
+                k_co.reshape(-1, 3)[:] += shift_arr
+                kb.data.foreach_set("co", k_co)
         o.data.update()
 
     arm_shift = armature_obj.matrix_world.inverted().to_3x3() @ world_shift
@@ -387,21 +437,12 @@ def ground_model_to_z0(armature_obj):
     return dz
 
 
-def apply_high_heel_retarget_fix(armature_obj):
+def apply_high_heel_retarget_fix(armature_obj, bound_meshes=None):
     """基于真实脚踝网格截面与骨骼几何动态计算高跟/小腿倾角校准，无硬编码比例。"""
-    bound_meshes = [
-        o
-        for o in bpy.data.objects
-        if o.type == "MESH"
-        and o.data
-        and o.vertex_groups
-        and (
-            o.parent == armature_obj
-            or any(
-                m.type == "ARMATURE" and m.object == armature_obj for m in o.modifiers
-            )
-        )
-    ]
+    if bound_meshes is None:
+        bound_meshes = [o for o in get_bound_meshes(armature_obj) if o.vertex_groups]
+    else:
+        bound_meshes = [o for o in bound_meshes if o.vertex_groups]
     arm_inv = armature_obj.matrix_world.inverted()
 
     ankle_y_bounds = {}
@@ -472,8 +513,8 @@ def apply_high_heel_retarget_fix(armature_obj):
                 f"   👠 [高跟坡度检测 {side}] Foot->Toes 俯角={slope_deg:.1f}° (>30°)，自动合并 {toe_b.name}->{foot_b.name}"
             )
 
-    merge_bone_pairs_to_parent(armature_obj, to_merge)
-    return len(to_merge) > 0
+    merge_bone_pairs_to_parent(armature_obj, to_merge, bound_meshes=bound_meshes)
+    return len(to_merge) > 0, to_merge
 
 
 def run(
@@ -483,11 +524,34 @@ def run(
     ground_to_zero=True,
     fix_high_heel_rig=True,
 ):
+    t0 = time.perf_counter()
     print(">>> [步骤 1] 规整鸣潮 MMD 骨骼命名、保护弹簧骨与校验躯干/脚踝链路...")
     armature_obj = next((o for o in bpy.data.objects if o.type == "ARMATURE"), None)
     if armature_obj:
-        weighted_bones = collect_weighted_bone_names(armature_obj)
+        # 若跳过了步骤 0 直接调用步骤 1，先拍取 MMD 物理快照
+        snapshot_mmd_physics_to_armature(armature_obj, overwrite=False)
+
+        bound_meshes = get_bound_meshes(armature_obj)
+        weighted_bones = collect_weighted_bone_names(
+            armature_obj, bound_meshes=bound_meshes
+        )
         existing_spring_bones = collect_existing_spring_bone_names(armature_obj)
+
+        ext = getattr(armature_obj.data, "vrm_addon_extension", None)
+        has_vrm_refs = bool(
+            ext
+            and (
+                (
+                    hasattr(ext, "spring_bone1")
+                    and len(getattr(ext.spring_bone1, "springs", [])) > 0
+                )
+                or (
+                    hasattr(ext, "vrm0")
+                    and len(getattr(ext.vrm0.secondary_animation, "bone_groups", []))
+                    > 0
+                )
+            )
+        )
 
         mmd_name_e_map = {}
         for pb in armature_obj.pose.bones:
@@ -668,6 +732,16 @@ def run(
 
         bpy.ops.object.mode_set(mode="OBJECT")
 
+        # 追踪所有骨骼改名链（old -> final）以便最后一次性映射到 SpringBone 快照
+        final_rename_map = {}
+        reverse_rename_map = {}
+
+        def record_rename(old_n, new_n):
+            origs = reverse_rename_map.pop(old_n, [old_n])
+            for o in origs:
+                final_rename_map[o] = new_n
+            reverse_rename_map.setdefault(new_n, []).extend(origs)
+
         existing = {b.name for b in armature_obj.data.bones}
         renamed = 0
         for bone in list(armature_obj.data.bones):
@@ -680,9 +754,29 @@ def run(
                     tmp = f"Aux_{tgt}_old"
                     while tmp in existing:
                         tmp += "_"
-                    if safe_rename_bone(armature_obj, occ, tmp, existing):
+                    occ_old = occ.name
+                    res_n = safe_rename_bone(
+                        armature_obj,
+                        occ,
+                        tmp,
+                        existing,
+                        bound_meshes=bound_meshes,
+                        has_vrm_refs=has_vrm_refs,
+                    )
+                    if res_n:
+                        record_rename(occ_old, res_n)
                         renamed += 1
-            if safe_rename_bone(armature_obj, bone, tgt, existing):
+            b_old = bone.name
+            res_n = safe_rename_bone(
+                armature_obj,
+                bone,
+                tgt,
+                existing,
+                bound_meshes=bound_meshes,
+                has_vrm_refs=has_vrm_refs,
+            )
+            if res_n:
+                record_rename(b_old, res_n)
                 renamed += 1
 
         for bone in list(armature_obj.data.bones):
@@ -694,11 +788,20 @@ def run(
             while cand in existing and cand != old:
                 cand = f"{base_en}_{idx}"
                 idx += 1
-            if safe_rename_bone(armature_obj, bone, cand, existing):
+            res_n = safe_rename_bone(
+                armature_obj,
+                bone,
+                cand,
+                existing,
+                bound_meshes=bound_meshes,
+                has_vrm_refs=has_vrm_refs,
+            )
+            if res_n:
+                record_rename(old, res_n)
                 renamed += 1
 
         if ground_to_zero:
-            dz = ground_model_to_z0(armature_obj)
+            dz = ground_model_to_z0(armature_obj, bound_meshes=bound_meshes)
             if abs(dz) >= 0.001:
                 print(
                     f"   👟 [自动接地] 已将鞋底最低点整体抬升 {dz:+.4f}m 对齐地面 Z=0.0"
@@ -706,24 +809,40 @@ def run(
 
         skip_toes = False
         if fix_high_heel_rig:
-            skip_toes = apply_high_heel_retarget_fix(armature_obj)
+            skip_toes, toe_merges = apply_high_heel_retarget_fix(
+                armature_obj, bound_meshes=bound_meshes
+            )
+            for src_b, dst_b in toe_merges.items():
+                record_rename(src_b, dst_b)
 
         assigned = validate_and_assign_vrm_humanoid(armature_obj, skip_toes=skip_toes)
-        # 改名后重新采集最新弹簧骨名称并死保，不被 max_bones 合并
-        protected_spring = collect_existing_spring_bone_names(armature_obj)
+        protected_spring = {
+            final_rename_map.get(n, n)
+            for n in collect_existing_spring_bone_names(armature_obj)
+        }
         protected_human = set(assigned.values()) | {"Root", "Pelvis"} | protected_spring
-        merged_cnt = merge_excess_bones_to_limit(
-            armature_obj, protected_human, max_bones=max_bones
+        merged_cnt, merged_map = merge_excess_bones_to_limit(
+            armature_obj,
+            protected_human,
+            max_bones=max_bones,
+            bound_meshes=bound_meshes,
         )
+        for src_b, dst_b in merged_map.items():
+            record_rename(src_b, dst_b)
+
         if merged_cnt > 0:
             assigned = validate_and_assign_vrm_humanoid(
                 armature_obj, skip_toes=skip_toes
             )
 
+        # 所有改名、接地与合并完成后，一次性把物理快照写入 VRM spring_bone1
+        apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=final_rename_map)
+
+        protected_spring_final = collect_existing_spring_bone_names(armature_obj)
         spring_cand_cnt = sum(
             1 for b in armature_obj.data.bones if is_physics_or_spring_bone(b.name)
         )
-        final_w = collect_weighted_bone_names(armature_obj)
+        final_w = collect_weighted_bone_names(armature_obj, bound_meshes=bound_meshes)
         core_check = {
             k: f"{assigned.get(k)}({final_w.get(assigned.get(k), 0)}v)"
             for k in (
@@ -750,7 +869,7 @@ def run(
             f"清理 {len(to_remove)}+{pruned_cnt} 根废骨，合并 {merged_cnt} 根，重命名 {renamed} 根。"
         )
         print(
-            f"   🌸 [弹簧骨保护] 已有SpringBone骨骼={len(protected_spring)}根 | 保留物理摇晃候选骨={spring_cand_cnt}根"
+            f"   🌸 [弹簧骨保护] 已有SpringBone骨骼={len(protected_spring_final)}根 | 保留物理摇晃候选骨={spring_cand_cnt}根"
         )
         print(f"   ⚖️ [核心骨骼链路与权重] {core_check}")
 
@@ -765,4 +884,4 @@ def run(
                 coll_data is bpy.data.objects and re.search(r"\.\d+$", item.name)
             ):
                 item.name = item.name.replace(jp_model_name, en_model_name)
-    print("✅ [步骤 1] 骨骼与命名处理完成！")
+    print(f"✅ [步骤 1] 骨骼与命名处理完成！耗时 {time.perf_counter() - t0:.2f}s")
