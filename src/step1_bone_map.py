@@ -10,7 +10,6 @@ GARBAGE_BONE_KEYWORDS = [
     "shadow",
     "IK_parent",
     "eye_control",
-    "_end",
     "ＩＫ",
     "_IK",
     "IK_",
@@ -20,6 +19,59 @@ GARBAGE_BONE_KEYWORDS = [
     "ビュー中心",
     "指先",
 ]
+
+PHYSICS_SPRING_KEYWORDS = (
+    "hair",
+    "bangs",
+    "sideburn",
+    "ahoge",
+    "twintail",
+    "ponytail",
+    "braid",
+    "skirt",
+    "ribbon",
+    "cape",
+    "frill",
+    "scarf",
+    "tie",
+    "sleeve",
+    "cloth",
+    "bust",
+    "boob",
+    "oppai",
+    "tail",
+    "ear",
+    "wing",
+    "feather",
+    "piao",
+    "spring",
+    "chain",
+    "belt",
+    "earring",
+    "flower",
+    "accessory",
+    "fur",
+    "髪",
+    "发",
+    "スカート",
+    "リボン",
+    "マント",
+    "袖",
+    "胸",
+    "尻尾",
+    "耳",
+    "羽",
+    "翼",
+    "飾",
+    "裙",
+    "飘",
+)
+
+
+def is_physics_or_spring_bone(name: str) -> bool:
+    low = name.lower()
+    return any(kw in low for kw in PHYSICS_SPRING_KEYWORDS)
+
 
 FLATTEN_CONTROL_BONES = {
     "センター",

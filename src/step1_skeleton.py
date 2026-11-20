@@ -1,3 +1,4 @@
+import math
 import re
 
 import bpy
@@ -8,6 +9,7 @@ from step1_bone_map import (
     FLATTEN_CONTROL_BONES,
     GARBAGE_BONE_KEYWORDS,
     build_vrm_humanoid_mappings,
+    is_physics_or_spring_bone,
     translate_non_ascii_bone_name,
 )
 
@@ -23,6 +25,50 @@ def is_ancestor(bone, maybe_ancestor):
             return True
         cur = cur.parent
     return False
+
+
+def iter_spring_bone_refs(ext):
+    """遍历 VRM 1.0 (spring_bone1) 与 VRM 0.x (secondary_animation) 中所有骨骼引用对象"""
+    if not ext:
+        return
+    if hasattr(ext, "spring_bone1"):
+        sb1 = ext.spring_bone1
+        for sp in getattr(sb1, "springs", []):
+            if hasattr(sp, "center") and hasattr(sp.center, "bone_name"):
+                yield sp.center
+            for j in getattr(sp, "joints", []):
+                if hasattr(j, "node") and hasattr(j.node, "bone_name"):
+                    yield j.node
+        for col in getattr(sb1, "colliders", []):
+            if hasattr(col, "node") and hasattr(col.node, "bone_name"):
+                yield col.node
+    if hasattr(ext, "vrm0") and hasattr(ext.vrm0, "secondary_animation"):
+        sa = ext.vrm0.secondary_animation
+        for bg in getattr(sa, "bone_groups", []):
+            if hasattr(bg, "center") and hasattr(bg.center, "bone_name"):
+                yield bg.center
+            for b in getattr(bg, "bones", []):
+                if hasattr(b, "bone_name"):
+                    yield b
+        for cg in getattr(sa, "collider_groups", []):
+            if hasattr(cg, "node") and hasattr(cg.node, "bone_name"):
+                yield cg.node
+
+
+def collect_existing_spring_bone_names(armature_obj):
+    ext = getattr(armature_obj.data, "vrm_addon_extension", None)
+    return {
+        ref.bone_name
+        for ref in iter_spring_bone_refs(ext)
+        if getattr(ref, "bone_name", "")
+    }
+
+
+def sync_spring_bone_rename(armature_obj, old_name, new_name):
+    ext = getattr(armature_obj.data, "vrm_addon_extension", None)
+    for ref in iter_spring_bone_refs(ext):
+        if ref.bone_name == old_name:
+            ref.bone_name = new_name
 
 
 def collect_weighted_bone_names(armature_obj):
@@ -102,6 +148,7 @@ def safe_rename_bone(armature_obj, bone, new_name, existing_names):
             and bone.name not in obj.vertex_groups
         ):
             obj.vertex_groups[old_name].name = bone.name
+    sync_spring_bone_rename(armature_obj, old_name, bone.name)
     return True
 
 
@@ -208,7 +255,6 @@ def bone_depth(b):
 
 
 def merge_bone_pairs_to_parent(armature_obj, child_to_parent):
-    """把指定骨骼的顶点权重无损累加到父骨骼并在 Edit 模式移除它们"""
     if not child_to_parent:
         return 0
     bound_meshes = [
@@ -275,14 +321,19 @@ def merge_excess_bones_to_limit(armature_obj, protected_names, max_bones=240):
         if not leaves:
             break
 
+        # 分级优先级：
+        # 0 = 非摇晃的扭转/辅助/道具骨 (twist, bip001_, aux, cancel, prop) -> 优先合并
+        # 1 = 其它普通辅助末梢骨
+        # 2 = 头发/裙摆/胸部/丝带等弹簧摇晃链 -> 尽量保留根中段，只从最深链条末端缩减
         def leaf_priority(b):
             low = b.name.lower()
-            is_helper = (
-                0
-                if any(k in low for k in ("twist", "bip001_", "aux", "piao", "cancel"))
-                else 1
-            )
-            return (is_helper, -bone_depth(b))
+            if any(k in low for k in ("twist", "bip001_", "aux", "cancel", "prop")):
+                tier = 0
+            elif is_physics_or_spring_bone(b.name):
+                tier = 2
+            else:
+                tier = 1
+            return (tier, -bone_depth(b))
 
         leaves.sort(key=leaf_priority)
         batch = leaves[:excess]
@@ -293,7 +344,6 @@ def merge_excess_bones_to_limit(armature_obj, protected_names, max_bones=240):
 
 
 def ground_model_to_z0(armature_obj):
-    """将模型网格（含所有形态键）与骨骼整体平移，使鞋底最低点严格落在 Z=0.0 地面"""
     bound_meshes = [
         o
         for o in bpy.data.objects
@@ -338,30 +388,92 @@ def ground_model_to_z0(armature_obj):
 
 
 def apply_high_heel_retarget_fix(armature_obj):
-    """修复高跟鞋模型在标准 Humanoid 重定向下的后仰与脚尖翘起问题：
-    1) 将 FootL/R 关节 Y 略微向小腿轴心靠拢（不动网格顶点），缓解小腿后倾；
-    2) 把 ToesL/R 权重并入 FootL/R 并取消 Toes 映射，避免重定向读取 -46° 陡斜脚掌矢量。
-    """
+    """基于真实脚踝网格截面与骨骼几何动态计算高跟/小腿倾角校准，无硬编码比例。"""
+    bound_meshes = [
+        o
+        for o in bpy.data.objects
+        if o.type == "MESH"
+        and o.data
+        and o.vertex_groups
+        and (
+            o.parent == armature_obj
+            or any(
+                m.type == "ARMATURE" and m.object == armature_obj for m in o.modifiers
+            )
+        )
+    ]
+    arm_inv = armature_obj.matrix_world.inverted()
+
+    ankle_y_bounds = {}
+    for side in ("L", "R"):
+        foot_b = armature_obj.data.bones.get(f"Foot{side}")
+        if not foot_b:
+            continue
+        fz = foot_b.head_local.z
+        ys = []
+        target_names = {f"Foot{side}", f"LowerLeg{side}"}
+        for o in bound_meshes:
+            vg_indices = {
+                o.vertex_groups[n].index for n in target_names if n in o.vertex_groups
+            }
+            if not vg_indices:
+                continue
+            to_arm = arm_inv @ o.matrix_world
+            for v in o.data.vertices:
+                if not any(g.group in vg_indices and g.weight > 0.1 for g in v.groups):
+                    continue
+                co_arm = to_arm @ v.co
+                if abs(co_arm.z - fz) <= 0.025:
+                    ys.append(co_arm.y)
+        if ys:
+            y_min, y_max = min(ys), max(ys)
+            margin = (y_max - y_min) * 0.20
+            ankle_y_bounds[side] = (y_min + margin, y_max - margin)
+
     bpy.context.view_layer.objects.active = armature_obj
     bpy.ops.object.mode_set(mode="EDIT")
     eb = armature_obj.data.edit_bones
     for side in ("L", "R"):
         knee = eb.get(f"LowerLeg{side}")
         foot = eb.get(f"Foot{side}")
-        if knee and foot:
-            # 把脚踝枢轴沿 Y 轴向小腿垂线收拢 50%，减轻 11° 小腿后倾
-            shift_y = (knee.head.y - foot.head.y) * 0.5
-            foot.head.y += shift_y
-            foot.tail.y += shift_y
+        if not knee or not foot or side not in ankle_y_bounds:
+            continue
+        dz = max(1e-4, knee.head.z - foot.head.z)
+        shin_tilt_deg = math.degrees(math.atan2(abs(knee.head.y - foot.head.y), dz))
+        if shin_tilt_deg <= 4.0:
+            continue
+        safe_min_y, safe_max_y = ankle_y_bounds[side]
+        new_y = max(safe_min_y, min(safe_max_y, knee.head.y))
+        delta_y = new_y - foot.head.y
+        if abs(delta_y) > 1e-4:
+            foot.head.y += delta_y
+            foot.tail.y += delta_y
+            print(
+                f"   📐 [脚踝动态校准 {side}] 小腿倾角={shin_tilt_deg:.1f}°, "
+                f"截面安全范围=[{safe_min_y:.3f}, {safe_max_y:.3f}], delta_y={delta_y:+.4f}m"
+            )
     bpy.ops.object.mode_set(mode="OBJECT")
 
     to_merge = {}
     for side in ("L", "R"):
         toe_b = armature_obj.data.bones.get(f"Toes{side}")
         foot_b = armature_obj.data.bones.get(f"Foot{side}")
-        if toe_b and foot_b and toe_b.parent:
+        if not toe_b or not foot_b or not toe_b.parent:
+            continue
+        dz = foot_b.head_local.z - toe_b.head_local.z
+        horiz = math.hypot(
+            toe_b.head_local.x - foot_b.head_local.x,
+            toe_b.head_local.y - foot_b.head_local.y,
+        )
+        slope_deg = math.degrees(math.atan2(dz, max(1e-4, horiz)))
+        if slope_deg > 30.0:
             to_merge[toe_b.name] = foot_b.name
+            print(
+                f"   👠 [高跟坡度检测 {side}] Foot->Toes 俯角={slope_deg:.1f}° (>30°)，自动合并 {toe_b.name}->{foot_b.name}"
+            )
+
     merge_bone_pairs_to_parent(armature_obj, to_merge)
+    return len(to_merge) > 0
 
 
 def run(
@@ -369,12 +481,14 @@ def run(
     en_model_name,
     max_bones=240,
     ground_to_zero=True,
-    fix_high_heel_rig=False,
+    fix_high_heel_rig=True,
 ):
-    print(">>> [步骤 1] 规整鸣潮 MMD 骨骼命名、校验躯干/脚趾链路与骨骼数量瘦身...")
+    print(">>> [步骤 1] 规整鸣潮 MMD 骨骼命名、保护弹簧骨与校验躯干/脚踝链路...")
     armature_obj = next((o for o in bpy.data.objects if o.type == "ARMATURE"), None)
     if armature_obj:
         weighted_bones = collect_weighted_bone_names(armature_obj)
+        existing_spring_bones = collect_existing_spring_bone_names(armature_obj)
+
         mmd_name_e_map = {}
         for pb in armature_obj.pose.bones:
             mmd_b = getattr(pb, "mmd_bone", None)
@@ -413,21 +527,28 @@ def run(
                 or b.name.endswith("IK")
             )
             and b.name not in weighted_bones
+            and b.name not in existing_spring_bones
         }
         if use_leg_l_d:
             to_remove.update(
                 d
                 for d in ("左足", "左ひざ", "左足首")
-                if d in eb and d not in weighted_bones
+                if d in eb
+                and d not in weighted_bones
+                and d not in existing_spring_bones
             )
         if use_leg_r_d:
             to_remove.update(
                 d
                 for d in ("右足", "右ひざ", "右足首")
-                if d in eb and d not in weighted_bones
+                if d in eb
+                and d not in weighted_bones
+                and d not in existing_spring_bones
             )
         to_remove.update(
-            c for c in FLATTEN_CONTROL_BONES if c in eb and c not in weighted_bones
+            c
+            for c in FLATTEN_CONTROL_BONES
+            if c in eb and c not in weighted_bones and c not in existing_spring_bones
         )
 
         for bn in list(to_remove):
@@ -508,7 +629,9 @@ def run(
                 rename_map[cand] = "ToesR"
                 break
 
-        protected = set(rename_map.keys()) | set(rename_map.values())
+        protected = (
+            set(rename_map.keys()) | set(rename_map.values()) | existing_spring_bones
+        )
         pruned_cnt = 0
         while True:
             leaves = [
@@ -517,6 +640,8 @@ def run(
                 if len(b.children) == 0
                 and b.name not in weighted_bones
                 and b.name not in protected
+                and not is_physics_or_spring_bone(b.name)
+                and not (b.parent and is_physics_or_spring_bone(b.parent.name))
                 and not any(
                     k in b.name
                     for k in (
@@ -579,26 +704,25 @@ def run(
                     f"   👟 [自动接地] 已将鞋底最低点整体抬升 {dz:+.4f}m 对齐地面 Z=0.0"
                 )
 
+        skip_toes = False
         if fix_high_heel_rig:
-            apply_high_heel_retarget_fix(armature_obj)
-            print("   👠 [高跟防后仰] 已收拢脚踝枢轴并合并脚趾权重至 FootL/R")
+            skip_toes = apply_high_heel_retarget_fix(armature_obj)
 
-        assigned = validate_and_assign_vrm_humanoid(
-            armature_obj, skip_toes=fix_high_heel_rig
-        )
-        protected_human = set(assigned.values()) | {"Root", "Pelvis"}
+        assigned = validate_and_assign_vrm_humanoid(armature_obj, skip_toes=skip_toes)
+        # 改名后重新采集最新弹簧骨名称并死保，不被 max_bones 合并
+        protected_spring = collect_existing_spring_bone_names(armature_obj)
+        protected_human = set(assigned.values()) | {"Root", "Pelvis"} | protected_spring
         merged_cnt = merge_excess_bones_to_limit(
             armature_obj, protected_human, max_bones=max_bones
         )
         if merged_cnt > 0:
-            assigned = (
-                validate_and_assign_vrm_humanoid(armature_obj, skip_to_zero=False)
-                if False
-                else validate_and_assign_vrm_humanoid(
-                    armature_obj, skip_toes=fix_high_heel_rig
-                )
+            assigned = validate_and_assign_vrm_humanoid(
+                armature_obj, skip_toes=skip_toes
             )
 
+        spring_cand_cnt = sum(
+            1 for b in armature_obj.data.bones if is_physics_or_spring_bone(b.name)
+        )
         final_w = collect_weighted_bone_names(armature_obj)
         core_check = {
             k: f"{assigned.get(k)}({final_w.get(assigned.get(k), 0)}v)"
@@ -622,8 +746,11 @@ def run(
             if k in assigned
         }
         print(
-            f"   🦴 骨骼处理完成：最终保留 {len(armature_obj.data.bones)} 根（<= {max_bones}），"
-            f"清理 {len(to_remove)}+{pruned_cnt} 根废骨，无损权重合并 {merged_cnt} 根多余末端骨，重命名 {renamed} 根。"
+            f"   🦴 骨骼处理完成：保留 {len(armature_obj.data.bones)} 根（上限={max_bones or '不限'}），"
+            f"清理 {len(to_remove)}+{pruned_cnt} 根废骨，合并 {merged_cnt} 根，重命名 {renamed} 根。"
+        )
+        print(
+            f"   🌸 [弹簧骨保护] 已有SpringBone骨骼={len(protected_spring)}根 | 保留物理摇晃候选骨={spring_cand_cnt}根"
         )
         print(f"   ⚖️ [核心骨骼链路与权重] {core_check}")
 
