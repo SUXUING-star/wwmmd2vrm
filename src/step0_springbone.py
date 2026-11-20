@@ -273,7 +273,17 @@ def _classify_spring_part(name: str) -> str:
     if any(k in low for k in ("胸", "bust", "boob", "oppai")):
         return "bust"
     if any(
-        k in low for k in ("前髪", "bangs", "ahoge", "アホ毛", "sideburn", "もみあげ")
+        k in low
+        for k in (
+            "前髪",
+            "刘海",
+            "liuhai",
+            "bangs",
+            "ahoge",
+            "アホ毛",
+            "sideburn",
+            "もみあげ",
+        )
     ):
         return "bangs"
     if any(
@@ -294,15 +304,26 @@ def _classify_spring_part(name: str) -> str:
         return "hair"
     if any(
         k in low
-        for k in ("スカート", "skirt", "マント", "cape", "裾", "裙", "cloth", "dress")
+        for k in (
+            "スカート",
+            "skirt",
+            "マント",
+            "cape",
+            "裾",
+            "裙",
+            "cloth",
+            "dress",
+            "袖",
+            "sleeve",
+        )
     ):
         return "skirt"
     return "other"
 
 
-def _compute_joint_params(bone_name, rb_obj, joint_obj):
+def _compute_joint_params(bone_name, rb_obj, joint_obj, t_chain=0.5, seg_len=0.05):
     part = _classify_spring_part(bone_name)
-    hit_radius = 0.015
+    hit_radius = 0.010
     if rb_obj is not None:
         shape, dims, _ = _get_mmd_rigid_dimensions(rb_obj)
         raw_r = (
@@ -310,7 +331,7 @@ def _compute_joint_params(bone_name, rb_obj, joint_obj):
             if shape in ("SPHERE", "CAPSULE")
             else min(dims[0], dims[1], dims[2])
         )
-        hit_radius = max(0.008, min(0.030, float(raw_r) * 0.5))
+        hit_radius = max(0.005, min(0.018, float(raw_r) * 0.40))
 
     mmd_sp = 0.0
     if joint_obj is not None:
@@ -320,28 +341,33 @@ def _compute_joint_params(bone_name, rb_obj, joint_obj):
 
     sp_norm = min(1.0, math.log10(1.0 + mmd_sp) / 2.5) if mmd_sp > 0.0 else 0.35
 
-    # 校准为 VRM 1.0 (three-vrm) 真实摆动区间
-    if part == "bust":
-        stiffness = 1.60 + 0.40 * sp_norm
-        drag_force = 0.55
-        gravity_power = 0.08
-    elif part == "bangs":
-        stiffness = 0.65 + 0.35 * sp_norm
-        drag_force = 0.40
-        gravity_power = 0.15
-    elif part == "hair":
-        stiffness = 0.45 + 0.35 * sp_norm
-        drag_force = 0.36
-        gravity_power = 0.20
-    elif part == "skirt":
-        stiffness = 0.70 + 0.35 * sp_norm
-        drag_force = 0.45
-        gravity_power = 0.25
-    else:
-        stiffness = 0.45 + 0.35 * sp_norm
-        drag_force = 0.38
-        gravity_power = 0.22
+    # 使用真实骨段长度（不再用 0.015/0.55 强行抬高微骨刚度），确保所有关节 alpha60 严格 <= 0.65
+    true_len = max(0.004, float(seg_len))
+    len_scale = max(0.08, min(1.0, true_len / 0.10))
+    t = max(0.0, min(1.0, float(t_chain)))
 
+    if part == "bust":
+        alpha_target = 0.62 + 0.06 * sp_norm
+        drag_force = 0.68
+        gravity_power = 0.010 * len_scale
+    elif part == "bangs":
+        alpha_target = (0.60 - 0.18 * t) + 0.04 * sp_norm
+        drag_force = 0.62 + 0.06 * t
+        gravity_power = 0.015 * len_scale
+    elif part == "hair":
+        alpha_target = (0.56 - 0.18 * t) + 0.04 * sp_norm
+        drag_force = 0.60 + 0.08 * t
+        gravity_power = 0.025 * len_scale
+    elif part == "skirt":
+        alpha_target = (0.60 - 0.20 * t) + 0.04 * sp_norm
+        drag_force = 0.62 + 0.06 * t
+        gravity_power = 0.030 * len_scale
+    else:
+        alpha_target = (0.54 - 0.18 * t) + 0.04 * sp_norm
+        drag_force = 0.60 + 0.08 * t
+        gravity_power = 0.025 * len_scale
+
+    stiffness = max(0.12, min(2.60, true_len * alpha_target * 60.0))
     return float(hit_radius), float(stiffness), float(drag_force), float(gravity_power)
 
 
@@ -467,20 +493,33 @@ def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
             and (b.parent is None or b.parent.name not in physics_bones)
         ]
         chains = _collect_linear_chains(roots, physics_bones)
-        springs = [
-            {
-                "name": f"Spring_{ch[0].name}_{idx}",
-                "groups": ["0"] if cols_by_group["0"] else [],
-                "joints": [
+        springs = []
+        for idx, ch in enumerate(chains):
+            chain_len = max(1, len(ch) - 1)
+            j_list = []
+            for j_idx, b in enumerate(ch):
+                seg_len = (
+                    (ch[j_idx + 1].head_local - b.head_local).length
+                    if j_idx + 1 < len(ch)
+                    else (b.tail_local - b.head_local).length
+                )
+                j_list.append(
                     {
                         "bone": b.name,
-                        "params": list(_compute_joint_params(b.name, None, None)),
+                        "params": list(
+                            _compute_joint_params(
+                                b.name, None, None, j_idx / chain_len, seg_len
+                            )
+                        ),
                     }
-                    for b in ch
-                ],
-            }
-            for idx, ch in enumerate(chains)
-        ]
+                )
+            springs.append(
+                {
+                    "name": f"Spring_{ch[0].name}_{idx}",
+                    "groups": ["0"] if cols_by_group["0"] else [],
+                    "joints": j_list,
+                }
+            )
         snap = {
             "mode": "heuristic",
             "center_bone": center_bone_name,
@@ -558,13 +597,23 @@ def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
     for idx, ch in enumerate(chains):
         active_grps = set()
         joint_specs = []
-        for b in ch:
+        chain_len = max(1, len(ch) - 1)
+        for j_idx, b in enumerate(ch):
             rb_obj = bone_to_rigid.get(b.name)
             j_obj = joint_by_rigid.get(rb_obj) if rb_obj else None
+            seg_len = (
+                (ch[j_idx + 1].head_local - b.head_local).length
+                if j_idx + 1 < len(ch)
+                else (b.tail_local - b.head_local).length
+            )
             joint_specs.append(
                 {
                     "bone": b.name,
-                    "params": list(_compute_joint_params(b.name, rb_obj, j_obj)),
+                    "params": list(
+                        _compute_joint_params(
+                            b.name, rb_obj, j_obj, j_idx / chain_len, seg_len
+                        )
+                    ),
                 }
             )
             if rb_obj:
@@ -738,6 +787,41 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
     def resolve_bone(bname):
         return rename_map.get(bname, bname)
 
+    def is_bone_ancestor(bone, maybe_anc):
+        cur = bone.parent
+        while cur:
+            if cur == maybe_anc:
+                return True
+            cur = cur.parent
+        return False
+
+    all_spring_bones = {
+        resolve_bone(j_spec["bone"])
+        for sp_spec in snap.get("springs", [])
+        for j_spec in sp_spec.get("joints", [])
+    }
+
+    def pick_local_center(part_name, root_bone_name):
+        root_b = bones.get(root_bone_name)
+        if not root_b:
+            return center_bone
+        if part_name in ("hair", "bangs"):
+            cands = (
+                "UpperChest",
+                "Chest",
+                "Spine",
+                "Hips",
+                center_bone or "Root",
+                "Root",
+            )
+        else:
+            cands = ("Hips", center_bone or "Root", "Root")
+        for c in cands:
+            cb = bones.get(c)
+            if cb and c not in all_spring_bones and is_bone_ancestor(root_b, cb):
+                return c
+        return ""
+
     arm_mat = armature_obj.matrix_world
     arm_scale = arm_mat.to_scale()
     avg_arm_scale = max(
@@ -879,9 +963,10 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
         cat = _classify_spring_part(valid_joints[0][0])
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
-        if center_bone and center_bone not in seen_b:
+        local_center = pick_local_center(cat, valid_joints[0][0])
+        if local_center and local_center not in seen_b:
             if hasattr(sp, "center") and hasattr(sp.center, "bone_name"):
-                sp.center.bone_name = center_bone
+                sp.center.bone_name = local_center
 
         sp.joints.clear()
         for bname, params in valid_joints:
@@ -914,7 +999,7 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
                             if rec["is_cap"]
                             else (pt_w - rec["p_a"]).length
                         )
-                        if d_w < rec["r_world"] + j_hit_r + 0.003:
+                        if d_w < rec["r_world"] + j_hit_r + 0.012:
                             overlaps = True
                             break
                     if overlaps:
@@ -937,10 +1022,32 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
     except Exception:
         pass
 
+    seg_lens = []
+    alphas = []
+    centers_stat = {}
+    for sp in sb1.springs:
+        c_name = getattr(getattr(sp, "center", None), "bone_name", "") or "None"
+        centers_stat[c_name] = centers_stat.get(c_name, 0) + 1
+        j_list = list(sp.joints)
+        for i_j, j in enumerate(j_list):
+            b = bones.get(j.node.bone_name)
+            if not b:
+                continue
+            if i_j + 1 < len(j_list) and j_list[i_j + 1].node.bone_name in bones:
+                nb = bones[j_list[i_j + 1].node.bone_name]
+                sl = (nb.head_local - b.head_local).length
+            else:
+                sl = (b.tail_local - b.head_local).length
+            seg_lens.append(sl)
+            if sl > 1e-4:
+                alphas.append(j.stiffness / (60.0 * sl))
+
+    sl_str = f"[{min(seg_lens):.3f}, {max(seg_lens):.3f}]" if seg_lens else "[]"
+    al_str = f"[{min(alphas):.2f}, {max(alphas):.2f}]" if alphas else "[]"
     print(
-        f"   🌸 [SpringBone 写入] springs={created_springs} 条（joints={total_joints} 个, 分布={cat_counts}），"
-        f"colliders={col_count} 个，colliderGroups={len(subkey_to_cg_ref)} 组，"
-        f"静息穿插免碰屏蔽={masked_overlap_links} 对。"
+        f"   🌸 [SpringBone 写入] springs={created_springs} 条（joints={total_joints} 个, 分布={cat_counts}, "
+        f"seg_len={sl_str}, alpha60={al_str}, center={centers_stat}），"
+        f"colliders={col_count} 个，colliderGroups={len(subkey_to_cg_ref)} 组，静息穿插免碰屏蔽={masked_overlap_links} 对。"
     )
     return created_springs, col_count
 
