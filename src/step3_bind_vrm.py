@@ -149,7 +149,7 @@ def is_mesh_bound_to_armature(obj, armature_obj):
 
 
 def run():
-    print(">>> [步骤 3/4] 开始将鸣潮标准表情绑定到 VRM 表情系统中...")
+    print(">>> [步骤 3/4] 开始将标准表情绑定到 VRM 表情系统中...")
 
     armature_obj, mesh_objs = get_armature_and_shape_meshes()
     if not armature_obj or not mesh_objs:

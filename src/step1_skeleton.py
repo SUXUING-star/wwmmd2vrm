@@ -525,7 +525,7 @@ def run(
     fix_high_heel_rig=True,
 ):
     t0 = time.perf_counter()
-    print(">>> [步骤 1] 规整鸣潮 MMD 骨骼命名、保护弹簧骨与校验躯干/脚踝链路...")
+    print(">>> [步骤 1] 规整 MMD 骨骼命名、保护弹簧骨与校验躯干/脚踝链路...")
     armature_obj = next((o for o in bpy.data.objects if o.type == "ARMATURE"), None)
     if armature_obj:
         # 若跳过了步骤 0 直接调用步骤 1，先拍取 MMD 物理快照

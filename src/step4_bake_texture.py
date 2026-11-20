@@ -123,9 +123,7 @@ def resize_if_needed(pil_img, max_size):
 
 
 def run(texture_dir, max_tex_size=1024):
-    print(
-        f">>> [步骤 4] 优化鸣潮 TEX 贴图（全图上限 {max_tex_size}px + 不透明转JPEG）..."
-    )
+    print(f">>> [步骤 4] 优化 TEX 贴图（全图上限 {max_tex_size}px + 不透明转JPEG）...")
 
     if not texture_dir:
         return

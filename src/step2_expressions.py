@@ -37,7 +37,7 @@ def get_armature_and_shape_meshes():
 
 
 def run():
-    print(">>> [步骤 2/4] 开始规范全部鸣潮 MMD 网格的表情形态键命名...")
+    print(">>> [步骤 2/4] 开始规范全部 MMD 网格的表情形态键命名...")
 
     armature_obj, mesh_objs = get_armature_and_shape_meshes()
     if not armature_obj or not mesh_objs:

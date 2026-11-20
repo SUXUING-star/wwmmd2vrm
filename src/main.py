@@ -62,7 +62,7 @@ def run(config):
     ground_to_zero = bool(config.get("ground_to_zero", True))
     fix_high_heel_rig = bool(config.get("fix_high_heel_rig", False))
 
-    print(f"\n>>> [wwmmd2vrm] 开始处理鸣潮模型: {jp} -> {en}")
+    print(f"\n>>> [wwmmd2vrm] 开始处理模型: {jp} -> {en}")
     print(f"   [路径] VRM 导出目录: {config['models_dir']}")
     print(
         f"   [路径] 贴图绝对路径: {tex} "
@@ -75,7 +75,7 @@ def run(config):
         en,
         max_bones=max_bones,
         ground_to_zero=ground_to_zero,
-        fix_high_heel_rig=fix_high_heel_rig,
+        fix_high_heel_rig=True,
     )
     step2_expressions.run()
     step3_bind_vrm.run()

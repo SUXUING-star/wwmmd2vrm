@@ -65,7 +65,7 @@ def get_shade_tint_tuple(role):
 
 
 def run(texture_dir):
-    print(">>> [步骤 5] 绑定鸣潮 VRM MToon 1.0 材质...")
+    print(">>> [步骤 5] 绑定 VRM MToon 1.0 材质...")
 
     manifest = {}
     if texture_dir:
