@@ -6,7 +6,7 @@ As we all know, manually modifying original models in Blender/VRoid Studio is a 
 To solve this, I developed a bpy-based pipeline to automatically convert MMD models into the VRM 1.0 format.
 
 The repository is target to Wuthering Waves MMD Models Structure.It's for personal, educational, and non-commercial purposes.
-([my related work](https://github.com/SUXUING-star/umammd2vrm))
+([my related work](https://github.com/SUXUING-star/umammd2vrm)
 
 ---
 
@@ -66,7 +66,7 @@ Each character directory in `public/` requires a `config.json` next to the `.ble
 2. **Verify Setup:** Ensure `config.json` and `Texture2D/`(or other name) are in the same folder as the `.blend` file.
 3. **Run Pipeline:** Open `blender.py` in Text Editor and edit the code path(the repsitory clone path),then you just copy the `blender.py` into the Blender's Text Editor,and click **Run Script**,the model will export in your project path.
 4. **Check Model**: Now you got a waifu VRM model with cute material like in game finally.
-[]()
+![preview](public/preview.png)
 
 
 ---

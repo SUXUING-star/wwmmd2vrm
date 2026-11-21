@@ -2,7 +2,7 @@ import re
 
 import bpy
 
-from step2_expressions import get_armature_and_shape_meshes
+from step2_shapekey import get_armature_and_shape_meshes
 
 
 def is_mouth_key(name: str) -> bool:
