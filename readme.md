@@ -64,11 +64,16 @@ Each character directory in `public/` requires a `config.json` next to the `.ble
 
 ## Pipeline Overview
 
-* **`step0_clean.py`**: Processes split normals on body/clothes, and removes vertex color artifacts around the mouth.
-* **`step1_skeleton.py`**: Processes MMD non-uniform(different lang, jp,cn,en,etc) or unused bones and maps bones to VRM Humanoid English definitions.
-* **`step2_expressions.py`**: Removes numeric prefixes from shape key names.
-* **`step3_bind_vrm.py`**: Maps shape keys to VRM expression presets and deletes unused morphs/NLA tracks.
-* **`step4_bake_texture.py`**: Bakes stacked eye highlights and packs texture channels into `vrm_temp_baked/`.
-* **`step5_mtoon_materials.py`**: Converts materials to MToon shaders and adjusts face shading offsets and GI strength.
-* **`step6_metadata.py`**: Writes license, author, and permission fields into the VRM 1.0 metadata.
-* **`step_vrma.py`**: (Optional) Add VRMA motion into model.
+1. Extract Spring Bones (Extract MMD rigid bodies & convert to VRM Spring Bones)
+   ↓
+2. Clean Mesh & Bones (Fix normals, remove unused rigid bodies, joints, and auxiliary bones)
+   ↓
+3. Bind Expressions (Normalize shape key names and bind to VRM Expressions)
+   ↓
+4. Bake Textures (Composite eye highlights & pack UV textures)
+   ↓
+5. Setup Materials (Configure VRM MToon shaders)
+   ↓
+6. Write Metadata (Set VRM 1.0 metadata)
+   ↓
+7. (Optional) Inject Animation (Import & attach animation files)
