@@ -1,4 +1,3 @@
-import importlib
 import json
 import math
 import time
@@ -6,13 +5,7 @@ import time
 import bpy
 from mathutils import Vector
 
-import utils.spring_solver as _spring_solver
-import utils.spring_utils as _spring_utils
 from step1_bone_map import is_physics_or_spring_bone
-
-importlib.reload(_spring_solver)
-importlib.reload(_spring_utils)
-
 from utils.spring_solver import solve_chain_spring_params
 from utils.spring_utils import (
     BODY_COLLIDER_KEYWORDS,

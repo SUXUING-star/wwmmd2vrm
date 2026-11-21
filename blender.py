@@ -20,9 +20,9 @@ scripts_dir = r"E:\3dmodels\blenders\wwmmd2vrm\src"
 if scripts_dir not in sys.path:
     sys.path.insert(0, scripts_dir)
 
-# 4. 清理模块缓存
+# 4. 清理模块缓存（包含 utils 子模块）
 for m in list(sys.modules.keys()):
-    if m == "main" or m.startswith("step"):
+    if m == "main" or m.startswith("step") or m == "utils" or m.startswith("utils."):
         del sys.modules[m]
 
 # 5. 运行主程序

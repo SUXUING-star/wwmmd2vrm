@@ -1,15 +1,8 @@
-import importlib
 import json
 import re
 import time
 
 import bpy
-
-import step0_springbone as _step0_springbone
-import utils.skeleton_utils as _skeleton_utils
-
-importlib.reload(_step0_springbone)
-importlib.reload(_skeleton_utils)
 
 from step0_springbone import (
     SNAPSHOT_PROP,
