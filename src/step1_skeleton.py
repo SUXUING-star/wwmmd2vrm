@@ -9,6 +9,7 @@ from mathutils import Vector
 from step0_springbone import (
     apply_mmd_spring_snapshot_to_vrm,
     get_snapshot_spring_bone_names,
+    get_snapshot_spring_roots_and_colliders,
     snapshot_mmd_physics_to_armature,
 )
 from step1_bone_map import (
@@ -312,6 +313,47 @@ def merge_bone_pairs_to_parent(armature_obj, child_to_parent, bound_meshes=None)
             removed += 1
     bpy.ops.object.mode_set(mode="OBJECT")
     return removed
+
+
+def decimate_spring_bones_stride(
+    armature_obj, spring_names, protected_names, max_bones=240, bound_meshes=None
+):
+    """当总骨数超过 max_bones 时，对弹簧链做隔节合并（保留根骨与全链跨度，权重并入父骨）"""
+    if max_bones <= 0 or len(armature_obj.data.bones) <= max_bones:
+        return 0, {}
+
+    bones = armature_obj.data.bones
+    spring_set = set(spring_names)
+    roots = [
+        b
+        for b in bones
+        if b.name in spring_set
+        and (b.parent is None or b.parent.name not in spring_set)
+    ]
+
+    candidates = []
+
+    def walk(b, depth):
+        if depth % 2 == 1 and b.name not in protected_names and b.parent:
+            candidates.append((depth, b.name, b.parent.name))
+        for ch in b.children:
+            if ch.name in spring_set:
+                walk(ch, depth + 1)
+
+    for r in roots:
+        walk(r, 0)
+
+    if not candidates:
+        return 0, {}
+
+    excess = len(bones) - max_bones
+    candidates.sort(key=lambda x: -x[0])
+    stride_merge = {bname: pname for _, bname, pname in candidates[:excess]}
+
+    merged = merge_bone_pairs_to_parent(
+        armature_obj, stride_merge, bound_meshes=bound_meshes
+    )
+    return merged, stride_merge
 
 
 def merge_excess_bones_to_limit(
@@ -816,11 +858,29 @@ def run(
                 record_rename(src_b, dst_b)
 
         assigned = validate_and_assign_vrm_humanoid(armature_obj, skip_toes=skip_toes)
-        protected_spring = {
+
+        protected_spring_all = {
             final_rename_map.get(n, n)
             for n in collect_existing_spring_bone_names(armature_obj)
         }
-        protected_human = set(assigned.values()) | {"Root", "Pelvis"} | protected_spring
+        protected_spring_roots = {
+            final_rename_map.get(n, n)
+            for n in get_snapshot_spring_roots_and_colliders(armature_obj)
+        }
+        protected_human = (
+            set(assigned.values()) | {"Root", "Pelvis"} | protected_spring_roots
+        )
+
+        stride_cnt, stride_map = decimate_spring_bones_stride(
+            armature_obj,
+            protected_spring_all,
+            protected_human,
+            max_bones=max_bones,
+            bound_meshes=bound_meshes,
+        )
+        for src_b, dst_b in stride_map.items():
+            record_rename(src_b, dst_b)
+
         merged_cnt, merged_map = merge_excess_bones_to_limit(
             armature_obj,
             protected_human,
@@ -829,6 +889,7 @@ def run(
         )
         for src_b, dst_b in merged_map.items():
             record_rename(src_b, dst_b)
+        merged_cnt += stride_cnt
 
         if merged_cnt > 0:
             assigned = validate_and_assign_vrm_humanoid(

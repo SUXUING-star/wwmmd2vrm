@@ -40,6 +40,66 @@ BODY_COLLIDER_KEYWORDS = (
     "足首",
 )
 
+NON_SPRING_LIMB_KEYWORDS = (
+    "hips",
+    "spine",
+    "chest",
+    "upperchest",
+    "neck",
+    "head",
+    "pelvis",
+    "root",
+    "全ての親",
+    "全ての亲",
+    "センター",
+    "腰",
+    "下半身",
+    "上半身",
+    "首",
+    "頭",
+    "头",
+    "目",
+    "eye",
+    "指",
+    "thumb",
+    "index",
+    "middle",
+    "ring",
+    "little",
+    "腕",
+    "ひじ",
+    "手首",
+    "shoulder",
+    "arm",
+    "hand",
+    "足",
+    "ひざ",
+    "足首",
+    "つま先",
+    "leg",
+    "foot",
+    "toe",
+    "ankle",
+    "shoe",
+    "boot",
+    "heel",
+    "sock",
+    "stocking",
+    "knee",
+    "thigh",
+    "calf",
+    "靴",
+    "鞋",
+    "袜",
+)
+
+
+def _is_excluded_from_spring(bone_name: str) -> bool:
+    low = bone_name.lower()
+    if any(sk in low for sk in ("skirt", "スカート", "裙", "cape", "マント")):
+        return False
+    return any(kw in low for kw in NON_SPRING_LIMB_KEYWORDS)
+
 
 def _call_vrm_op(op_name, **kwargs):
     op_ns = getattr(bpy.ops, "vrm", None)
@@ -345,7 +405,7 @@ def _extract_mmd_joint_hints(rb_obj, joint_obj):
 def _compute_damped_joint_params(
     bone_name, hit_radius, sp_norm, t_chain=0.5, seg_len=0.05
 ):
-    """按临界/微过阻尼公式解算参数，保证 20~60fps 启动与静息态无过冲震荡。"""
+    """按临界/微过阻尼公式解算参数，同时给短骨/前发设刚度下限以兼容 VRoid Hub。"""
     part = _classify_spring_part(bone_name)
     true_len = max(0.005, float(seg_len))
     len_scale = max(0.05, min(1.0, true_len / 0.10))
@@ -356,8 +416,8 @@ def _compute_damped_joint_params(
         drag_force = 0.86
         gravity_power = 0.0
     elif part == "bangs":
-        alpha_target = (0.21 - 0.06 * t) + 0.03 * sp_norm
-        drag_force = 0.82 + 0.04 * t
+        alpha_target = (0.24 - 0.04 * t) + 0.03 * sp_norm
+        drag_force = 0.88 + 0.04 * t
         gravity_power = 0.0
     elif part == "hair":
         alpha_target = (0.19 - 0.05 * t) + 0.03 * sp_norm
@@ -372,8 +432,11 @@ def _compute_damped_joint_params(
         drag_force = 0.80 + 0.05 * t
         gravity_power = 0.008 * len_scale
 
-    # 严格随真实骨长线性缩放，不再设置 0.12 下限以免短骨 alpha60 爆表
-    stiffness = max(0.01, min(2.00, true_len * alpha_target * 60.0))
+    stiffness = true_len * alpha_target * 60.0
+    if part == "bangs":
+        stiffness = max(1.20, min(2.50, stiffness))
+    else:
+        stiffness = max(0.30, min(2.00, stiffness))
     return float(hit_radius), float(stiffness), float(drag_force), float(gravity_power)
 
 
@@ -440,49 +503,11 @@ def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
     joints = [o for o in bpy.data.objects if getattr(o, "mmd_type", "NONE") == "JOINT"]
 
     if not rigid_bodies:
-        core_exclude = (
-            "hips",
-            "spine",
-            "chest",
-            "upperchest",
-            "neck",
-            "head",
-            "pelvis",
-            "root",
-            "全ての親",
-            "センター",
-            "腰",
-            "下半身",
-            "上半身",
-            "首",
-            "頭",
-            "头",
-            "目",
-            "eye",
-            "指",
-            "thumb",
-            "index",
-            "middle",
-            "ring",
-            "little",
-            "腕",
-            "ひじ",
-            "手首",
-            "足",
-            "ひざ",
-            "足首",
-            "shoulder",
-            "arm",
-            "hand",
-            "leg",
-            "foot",
-            "toe",
-        )
         physics_bones = {
             b.name
             for b in bones
             if is_physics_or_spring_bone(b.name)
-            and not any(ex in b.name.lower() for ex in core_exclude)
+            and not _is_excluded_from_spring(b.name)
         }
         if not physics_bones:
             return False
@@ -582,24 +607,7 @@ def snapshot_mmd_physics_to_armature(armature_obj=None, overwrite=False):
             ):
                 bone_to_rigid[raw_bone_name] = rb_obj
 
-    humanoid_core = {
-        "Hips",
-        "Spine",
-        "Chest",
-        "UpperChest",
-        "Neck",
-        "Head",
-        "全ての親",
-        "全ての亲",
-        "センター",
-        "下半身",
-        "上半身",
-        "上半身2",
-        "首",
-        "頭",
-        "头",
-    }
-    physics_bones = {b for b in bone_to_rigid if b not in humanoid_core}
+    physics_bones = {b for b in bone_to_rigid if not _is_excluded_from_spring(b)}
     roots = [
         b
         for b in bones
@@ -686,6 +694,26 @@ def get_snapshot_spring_bone_names(armature_obj):
         for j in sp.get("joints", []):
             if j.get("bone"):
                 names.add(j["bone"])
+    return names
+
+
+def get_snapshot_spring_roots_and_colliders(armature_obj):
+    if not armature_obj or SNAPSHOT_PROP not in armature_obj:
+        return set()
+    try:
+        snap = json.loads(armature_obj[SNAPSHOT_PROP])
+    except Exception:
+        return set()
+
+    names = set()
+    for cols in snap.get("collider_groups", {}).values():
+        for c in cols:
+            if c.get("bone"):
+                names.add(c["bone"])
+    for sp in snap.get("springs", []):
+        joints = sp.get("joints", [])
+        if joints and joints[0].get("bone"):
+            names.add(joints[0]["bone"])
     return names
 
 
@@ -806,41 +834,6 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
     def resolve_bone(bname):
         return rename_map.get(bname, bname)
 
-    def is_bone_ancestor(bone, maybe_anc):
-        cur = bone.parent
-        while cur:
-            if cur == maybe_anc:
-                return True
-            cur = cur.parent
-        return False
-
-    all_spring_bones = {
-        resolve_bone(j_spec["bone"])
-        for sp_spec in snap.get("springs", [])
-        for j_spec in sp_spec.get("joints", [])
-    }
-
-    def pick_local_center(part_name, root_bone_name):
-        root_b = bones.get(root_bone_name)
-        if not root_b:
-            return center_bone
-        if part_name in ("hair", "bangs"):
-            cands = (
-                "UpperChest",
-                "Chest",
-                "Spine",
-                "Hips",
-                center_bone or "Root",
-                "Root",
-            )
-        else:
-            cands = ("Hips", center_bone or "Root", "Root")
-        for c in cands:
-            cb = bones.get(c)
-            if cb and c not in all_spring_bones and is_bone_ancestor(root_b, cb):
-                return c
-        return ""
-
     arm_mat = armature_obj.matrix_world
     arm_scale = arm_mat.to_scale()
     avg_arm_scale = max(
@@ -939,11 +932,6 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
         )
 
     # 3. 建立 Springs，过滤零长度退化关节并按真实 seg_len 重算阻尼参数
-    raw_center = snap.get("center_bone", "")
-    center_bone = resolve_bone(raw_center) if raw_center else ""
-    if center_bone not in bones:
-        center_bone = "Root" if "Root" in bones else ""
-
     cat_counts = {"hair": 0, "bangs": 0, "skirt": 0, "bust": 0, "other": 0}
     created_springs = 0
     total_joints = 0
@@ -1012,10 +1000,7 @@ def apply_mmd_spring_snapshot_to_vrm(armature_obj, rename_map=None, overwrite=Tr
         cat = _classify_spring_part(resolved_joints[0][0])
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
-        local_center = pick_local_center(cat, resolved_joints[0][0])
-        if local_center and local_center not in seen_b:
-            if hasattr(sp, "center") and hasattr(sp.center, "bone_name"):
-                sp.center.bone_name = local_center
+        # 留空 center，避免 VRoid Hub 后端重处理时产生中心空间位移异常
 
         sp.joints.clear()
         for bname, params in resolved_joints:
