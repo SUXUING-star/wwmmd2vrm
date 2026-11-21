@@ -6,7 +6,8 @@ As we all know, manually modifying original models in Blender/VRoid Studio is a 
 To solve this, I developed a bpy-based pipeline to automatically convert MMD models into the VRM 1.0 format.
 
 The repository is target to Wuthering Waves MMD Models Structure.It's for personal, educational, and non-commercial purposes.
-([my related work](https://github.com/SUXUING-star/umammd2vrm)
+
+[my related work](https://github.com/SUXUING-star/umammd2vrm)
 
 ---
 
